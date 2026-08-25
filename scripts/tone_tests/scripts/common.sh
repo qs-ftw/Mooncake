@@ -150,9 +150,11 @@ docker_launch(){
     # to classic, which would make the test pass without testing TENT at all.
     if [ "${USE_TENT}" = "true" ]; then
         echo "=== Verifying TENT runtime in installed mooncake ==="
-        if ! ${docker_exec} "p=\$(python -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))'); \
+        # python3, not python: the vllm/vllm-openai image ships pip for
+        # python3 without a `python` alias, and the check must run there too.
+        if ! ${docker_exec} "p=\$(python3 -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))'); \
             strings \$p/engine.so | grep -q MC_USE_TENT && \
-            python -c 'import mooncake.engine'"; then
+            python3 -c 'import mooncake.engine'"; then
             echo "ERROR: USE_TENT=true but the installed mooncake wheel lacks the TENT runtime." >&2
             echo "       The CI wheel must be built with -DUSE_TENT=ON (_build-wheel.yaml use-tent: true)." >&2
             return 1
