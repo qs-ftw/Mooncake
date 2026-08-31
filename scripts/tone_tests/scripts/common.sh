@@ -583,8 +583,12 @@ setup_node_env() {
     extra_args="$extra_args --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 --device=/dev/infiniband/rdma_cm "
     if [ "${USE_TENT}" = "true" ]; then
         # Container-level env: every sglang server (and pytest-spawned server)
-        # inside inherits the TENT runtime. Metrics enabled for CI diagnostics.
-        extra_args="$extra_args -e MC_USE_TENT=1 -e TENT_METRICS_ENABLED=true"
+        # inside inherits the TENT runtime. Metrics disabled: all ranks in
+        # this single-container topology inherit one TENT_METRICS_HTTP_PORT,
+        # so only one rank (nondeterministic) would ever expose an endpoint
+        # while the rest degrade to log-only. Re-enable together with the
+        # per-rank port assignment (base + gpu_id) in the sglang integration.
+        extra_args="$extra_args -e MC_USE_TENT=1 -e TENT_METRICS_ENABLED=false"
     fi
     if [ "${USE_HUGGINGFACE_MIRROR}" = "true" ]; then
         extra_args="$extra_args -e HF_ENDPOINT=${HUGGINGFACE_MIRROR} -e HF_HUB_ENABLE_HF_TRANSFER=1"
