@@ -1083,6 +1083,17 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     }
                     restore.restored_allocator = std::move(restored->allocator);
                     restore.buffers = std::move(restored->buffers);
+                } else if (kvc_master_block_size() > 0) {
+                    // KVC P2d 定长 slot 分配器（A2: 重挂位图重建）
+                    auto restored = RestoreKvcSlotAllocator(
+                        restore.segment.name, restore.segment.base,
+                        restore.segment.size, restore.segment.te_endpoint,
+                        restore.descriptors);
+                    if (!restored) {
+                        return fail_remount(ErrorCode::INVALID_PARAMS);
+                    }
+                    restore.restored_allocator = std::move(restored->allocator);
+                    restore.buffers = std::move(restored->buffers);
                 } else {
                     return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
                 }
@@ -8334,6 +8345,18 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     return total;
 }
 
+namespace {
+// C2: 与 client_service kvcflip::fnv1a 逐位同式（key_hash 守卫的比对前提）
+inline uint64_t kvc_fnv1a(const std::string& s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (char c : s) {
+        h ^= (unsigned char)c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+}  // namespace
+
 void MasterService::BatchEvict(double evict_ratio_target,
                                double evict_ratio_lowerbound) {
     if (evict_ratio_target < evict_ratio_lowerbound) {
@@ -8344,6 +8367,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
 
     auto now = std::chrono::system_clock::now();
+
+    // C2 驱逐推送收集（key 在此层才有; hash 守卫防误杀复用 slot）
+    std::vector<KvcInvalidateEntry> c2_entries;
+    std::string c2_endpoint;
+    const bool c2_push = kvc_master_block_size() > 0 &&
+                         std::getenv("KVC_EVICT_PUSH") != nullptr;
 
     auto is_evictable_memory_replica = [](const Replica& replica) {
         return replica.is_memory_replica() && replica.is_completed() &&
@@ -8369,6 +8398,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 metadata, is_evictable_memory_replica);
             const size_t replica_count = replicas.size();
             if (!replicas.empty()) {
+                if (c2_push) {
+                    const uint64_t kh = kvc_fnv1a(metadata.user_key);
+                    for (const auto& replica : replicas) {
+                        if (!replica.is_memory_replica())
+                            continue;
+                        const auto& desc = replica.get_descriptor()
+                                               .get_memory_descriptor()
+                                               .buffer_descriptor;
+                        c2_entries.push_back(
+                            {desc.buffer_address_, desc.size_, kh});
+                        c2_endpoint = desc.transport_endpoint_;
+                    }
+                }
                 deferred_replicas.emplace_back(std::move(replicas));
             }
             const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
@@ -8936,7 +8978,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     evicted_count += evict_result.evicted_objects;
                     evicted_this_pass += evict_result.evicted_objects;
                 }
-                deferred_replicas.clear();
+                // C2: 被驱逐对象的 slot 失效推送给段 owner daemon（TaskPoll 通道）。
+                    // kvc_master_block_size()==0 时零开销。
+                    /* C2: 提交本轮驱逐推送（收集在 evict_replicas 内完成,
+                     * entries 带 key_hash 守卫）; KVC_EVICT_PUSH 默认关 */
+                    if (!c2_entries.empty()) {
+                        UUID owner_client;
+                        if (segment_manager_.getSegmentAccess()
+                                .GetClientIdBySegmentName(
+                                    c2_endpoint, owner_client) ==
+                            ErrorCode::OK) {
+                            task_manager_.get_write_access()
+                                .submit_task_typed<TaskType::KVC_INVALIDATE>(
+                                    owner_client,
+                                    {c2_endpoint, std::move(c2_entries)});
+                        }
+                        c2_entries.clear();
+                    }
+                    deferred_replicas.clear();
             }
         };
 
@@ -9027,7 +9086,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         }
                     }
                 }
-                deferred_replicas.clear();
+                // C2: 被驱逐对象的 slot 失效推送给段 owner daemon（TaskPoll 通道）。
+                    // kvc_master_block_size()==0 时零开销。
+                    /* C2: 提交本轮驱逐推送（收集在 evict_replicas 内完成,
+                     * entries 带 key_hash 守卫）; KVC_EVICT_PUSH 默认关 */
+                    if (!c2_entries.empty()) {
+                        UUID owner_client;
+                        if (segment_manager_.getSegmentAccess()
+                                .GetClientIdBySegmentName(
+                                    c2_endpoint, owner_client) ==
+                            ErrorCode::OK) {
+                            task_manager_.get_write_access()
+                                .submit_task_typed<TaskType::KVC_INVALIDATE>(
+                                    owner_client,
+                                    {c2_endpoint, std::move(c2_entries)});
+                        }
+                        c2_entries.clear();
+                    }
+                    deferred_replicas.clear();
             }
         } else if (!soft_pin_objects.empty()) {
             // Second pass B: Prioritize evicting objects without soft pin,
@@ -9092,7 +9168,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         }
                     }
                 }
-                deferred_replicas.clear();
+                // C2: 被驱逐对象的 slot 失效推送给段 owner daemon（TaskPoll 通道）。
+                    // kvc_master_block_size()==0 时零开销。
+                    /* C2: 提交本轮驱逐推送（收集在 evict_replicas 内完成,
+                     * entries 带 key_hash 守卫）; KVC_EVICT_PUSH 默认关 */
+                    if (!c2_entries.empty()) {
+                        UUID owner_client;
+                        if (segment_manager_.getSegmentAccess()
+                                .GetClientIdBySegmentName(
+                                    c2_endpoint, owner_client) ==
+                            ErrorCode::OK) {
+                            task_manager_.get_write_access()
+                                .submit_task_typed<TaskType::KVC_INVALIDATE>(
+                                    owner_client,
+                                    {c2_endpoint, std::move(c2_entries)});
+                        }
+                        c2_entries.clear();
+                    }
+                    deferred_replicas.clear();
             }
         } else {
             LOG(ERROR) << "Error in second pass eviction: target_evict_num="

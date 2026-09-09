@@ -606,6 +606,586 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+// ============================================================================
+// KVC position cache adapter (hpc-redis kvc-sdk, P2b)
+//
+// 目标: 跳过 master GetReplicaList RPC（直读后它成为延迟大头）。
+// 安全规则: 缓存 (key → QueryResult + 观测到的 slot key_hash/write_seq)，
+//   命中时先查共享内存 slot 状态做硬校验 ——
+//     state==READY && key_hash 匹配 && write_seq 未变
+//   任何不满足 → 缓存 miss，回退 master RPC。
+//   （这使 slot 复用/覆写对读者可见 —— 与 Mooncake 租约互补：
+//     租约是 master 侧时间窗，slot 校验是介质侧硬证据。）
+//
+// 环境变量: KVC_POS_CACHE=1 启用（设备取 KVC_FLIP_DEVICE；几何自 region
+//           header 自描述读取，KVC_FLIP_BLOCK/_BYTES 仅作断言）；
+//           KVC_POS_CACHE_TTL_MS（默认 30000）。
+// ============================================================================
+#include <dlfcn.h>
+#include <atomic>
+#include <unordered_map>
+#include "/root/gqs/codespace/UnifiedBus/hpc-redis/kvc-sdk/include/kvc/kvc_server.h"
+namespace kvcpos {
+namespace {
+struct Api {
+    kvc_region_t *(*open_local)(const kvc_region_config_t *);
+    uint64_t (*owner_base)(const kvc_region_t *);
+    uint64_t (*data_bytes)(const kvc_region_t *);
+    int (*slot_query)(const kvc_region_t *, uint32_t, void *);
+    int (*slot_invalidate)(kvc_region_t *, uint32_t);
+    int (*probe_identity)(const char *, uint64_t, uint32_t,
+                          kvc_region_meta_t *, uint64_t *, uint32_t *);
+    uint64_t (*identity_hash)(const char *);
+    uint32_t (*owner_epoch)(const kvc_region_t *);
+};
+Api g_api;
+kvc_region_t *g_region = nullptr;
+bool g_init_failed = false;   // 一次性放弃: 失败后不再重试
+char g_disable_reason[512];
+uint32_t g_block = 0;
+uint64_t g_owner_base = 0, g_data_bytes = 0;
+uint32_t g_epoch = 0;         // owner 身代快照（R2: daemon 重启检测）
+uint64_t g_epoch_flush = 0;   // 身代变化触发缓存清空的计数（观测用）
+std::mutex g_mutex;
+/* QueryResult 成员为 const（禁赋值），缓存其组件，命中时重构 */
+struct Entry {
+    std::vector<Replica::Descriptor> replicas;
+    std::chrono::steady_clock::time_point lease_timeout;
+    std::optional<uint64_t> checksum;
+    uint64_t key_hash;
+    uint64_t write_seq;
+    std::chrono::steady_clock::time_point cached_at;
+};
+std::unordered_map<std::string, Entry> g_cache;
+uint64_t g_hits = 0, g_misses = 0, g_invalid = 0;
+
+/* R8: 周期性计数器出口（60s 一条） */
+inline void metrics_tick() {
+    static time_t last = 0;
+    time_t now = ::time(nullptr);
+    if (now - last < 60)
+        return;
+    last = now;
+    if (g_init_failed)
+        LOG(INFO) << "KVC-POSCACHE metrics: disabled=1 reason=\""
+                  << g_disable_reason << "\" hits=" << g_hits
+                  << " misses=" << g_misses << " invalid=" << g_invalid
+                  << " epoch_flush=" << g_epoch_flush;
+    else
+        LOG(INFO) << "KVC-POSCACHE metrics: disabled=0"
+                  << " hits=" << g_hits << " misses=" << g_misses
+                  << " invalid=" << g_invalid
+                  << " epoch_flush=" << g_epoch_flush;
+}
+
+inline uint64_t fnv1a(const std::string &s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (char c : s) {
+        h ^= (unsigned char)c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+bool enabled() { return std::getenv("KVC_POS_CACHE") != nullptr; }
+
+uint64_t ttl_ms() {
+    static uint64_t v = []() {
+        const char *e = std::getenv("KVC_POS_CACHE_TTL_MS");
+        return e ? strtoull(e, nullptr, 0) : 30000ULL;
+    }();
+    return v;
+}
+
+
+// T0-2: 永久禁用 + 一次性告警（此后 poscache 旁路，每次走 master RPC）
+void disable(const std::string &reason) {
+    if (!g_init_failed)
+        LOG(ERROR) << "KVC-POSCACHE: PERMANENTLY DISABLED — " << reason
+                   << " [env: KVC_FLIP_DEVICE="
+                   << (std::getenv("KVC_FLIP_DEVICE") ? std::getenv("KVC_FLIP_DEVICE") : "<unset>")
+                   << "] — every get falls back to master GetReplicaList";
+    snprintf(g_disable_reason, sizeof(g_disable_reason), "%s",
+             reason.c_str());
+    g_init_failed = true;
+}
+
+// transport_endpoint（"tcp://host:port"）→ host（host-only 身份，与 kvcflip 同式）
+inline std::string endpoint_host(const std::string &ep) {
+    auto scheme = ep.find("://");
+    size_t beg = scheme == std::string::npos ? 0 : scheme + 3;
+    auto colon = ep.find(':', beg);
+    return ep.substr(beg, colon == std::string::npos ? std::string::npos
+                                                     : colon - beg);
+}
+
+bool lazy_init(const std::string &expected_host = std::string()) {
+    if (g_region)
+        return true;
+    if (g_init_failed)
+        return false;
+    void *h = dlopen(std::getenv("KVC_SDK_LIB") ? std::getenv("KVC_SDK_LIB")
+                                                : "libkvc_server.so",
+                     RTLD_NOW);
+    if (!h) {
+        disable(std::string("dlopen failed: ") + dlerror());
+        return false;
+    }
+    {
+        auto ver = (uint32_t (*)())dlsym(h, "kvc_api_version");
+        if (!ver || ver() != KVC_ABI_VERSION) {
+            disable(ver ? "SDK ABI version mismatch — redeploy matching SDK"
+                        : "SDK missing kvc_api_version — redeploy matching SDK");
+            return false;
+        }
+    }
+    g_api.open_local = (kvc_region_t * (*)(const kvc_region_config_t *))
+        dlsym(h, "kvc_region_open_local");
+    g_api.owner_base =
+        (uint64_t(*)(const kvc_region_t *))dlsym(h, "kvc_region_owner_base");
+    g_api.data_bytes =
+        (uint64_t(*)(const kvc_region_t *))dlsym(h, "kvc_region_data_bytes");
+    g_api.slot_query =
+        (int (*)(const kvc_region_t *, uint32_t, void *))dlsym(h,
+                                                               "kvc_slot_query");
+    g_api.slot_invalidate =
+        (int (*)(kvc_region_t *, uint32_t))dlsym(h, "kvc_slot_invalidate");
+    g_api.probe_identity =
+        (int (*)(const char *, uint64_t, uint32_t, kvc_region_meta_t *,
+                 uint64_t *, uint32_t *))dlsym(h, "kvc_region_probe_identity");
+    g_api.identity_hash =
+        (uint64_t (*)(const char *))dlsym(h, "kvc_identity_hash");
+    g_api.owner_epoch =
+        (uint32_t (*)(const kvc_region_t *))dlsym(h, "kvc_region_owner_epoch");
+    if (!g_api.open_local || !g_api.owner_base || !g_api.data_bytes ||
+        !g_api.slot_query || !g_api.slot_invalidate ||
+        !g_api.probe_identity || !g_api.identity_hash || !g_api.owner_epoch) {
+        disable("dlsym incomplete (SDK ABI mismatch — rebuild/redeploy SDK)");
+        return false;
+    }
+
+    const char *dev = std::getenv("KVC_FLIP_DEVICE");
+    if (!dev) {
+        disable("KVC_POS_CACHE set but KVC_FLIP_DEVICE unset");
+        return false;
+    }
+
+    /* T0-1 几何自读: header 权威，env 只作断言 */
+    kvc_region_meta_t geo = {};
+    uint64_t host_id = 0;
+    uint32_t epoch = 0;
+    int prc = g_api.probe_identity(dev, 0, KVC_REGION_O_SYNC_FALLBACK, &geo,
+                                   &host_id, &epoch);
+    if (prc == KVC_ENOENT) {
+        disable("device has no KVC region (wrong device or owner never "
+                "initialized)");
+        return false;
+    }
+    if (prc != KVC_OK) {
+        disable("region header corrupt/geometry inconsistent — wrong device?");
+        return false;
+    }
+    if (const char *e = std::getenv("KVC_FLIP_BYTES")) {
+        if (strtoull(e, nullptr, 0) != geo.data_bytes + geo.data_off) {
+            disable("KVC_FLIP_BYTES mismatches region header — fix env or "
+                    "unset it");
+            return false;
+        }
+    }
+    if (const char *e = std::getenv("KVC_FLIP_BLOCK")) {
+        if ((uint32_t)strtoul(e, nullptr, 0) != geo.block_size) {
+            disable("KVC_FLIP_BLOCK mismatches region header");
+            return false;
+        }
+    }
+    /* T0-1 身份核验（put 路径传入 expected_host 时执行） */
+    if (host_id != 0 && !expected_host.empty()) {
+        if (g_api.identity_hash(expected_host.c_str()) != host_id) {
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                     "owner identity mismatch: region claims host-hash 0x%llx,"
+                     " master metadata says '%s' — wrong device mapping?",
+                     (unsigned long long)host_id, expected_host.c_str());
+            disable(buf);
+            return false;
+        }
+    }
+
+    kvc_region_config_t cfg = {};
+    cfg.region_id = geo.region_id;
+    cfg.provider = KVC_PROVIDER_DEVICE;
+    snprintf(cfg.device_path, sizeof(cfg.device_path), "%s", dev);
+    cfg.block_size = geo.block_size;
+    cfg.bytes = geo.data_bytes + geo.data_off;
+    cfg.flags = KVC_REGION_O_SYNC_FALLBACK;
+
+    g_region = g_api.open_local(&cfg);
+    if (!g_region) {
+        disable("open region failed after probe");
+        return false;
+    }
+    g_owner_base = g_api.owner_base(g_region);
+    g_data_bytes = g_api.data_bytes(g_region);
+    g_epoch = g_api.owner_epoch(g_region);
+    g_block = geo.block_size;
+    if (g_owner_base == 0) {
+        disable("owner base not published (segment owner must be up first)");
+        return false;
+    }
+    LOG(INFO) << "KVC-POSCACHE: enabled (block=" << g_block
+              << " bytes=" << cfg.bytes << " owner_epoch=" << g_epoch
+              << " entries cap 4M ttl=" << ttl_ms() << "ms)";
+    return true;
+}
+
+/* T0-1/R2: owner 重启（epoch 变化）→ 清空全部缓存（旧 buffer_address_ 是
+ * 旧 daemon 的 VA）+ 刷新 owner_base。返回 true = 本次作 miss 处理。 */
+bool owner_restarted_flush() {
+    if (!g_region)
+        return false;
+    uint32_t e = g_api.owner_epoch(g_region);
+    if (e == g_epoch)
+        return false;
+    uint64_t base = g_api.owner_base(g_region);
+    if (base == 0) {
+        disable("owner restarted and has not republished base");
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_cache.clear();   /* 缓存里的 buffer_address_ 全部随旧身代作废 */
+    }
+    g_owner_base = base;
+    g_epoch = e;
+    g_epoch_flush++;
+    return true;
+}
+
+// 缓存命中且 slot 硬校验通过 → 返回重构的 QueryResult（组件拷贝构造）
+std::optional<mooncake::QueryResult> try_get(const std::string &key) {
+    if (!enabled() || !lazy_init())
+        return std::nullopt;
+    if (owner_restarted_flush())
+        return std::nullopt;   // 身代刚切换，本拍作 miss
+    metrics_tick();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_cache.find(key);
+    if (it == g_cache.end()) {
+        g_misses++;
+        return std::nullopt;
+    }
+    if (std::chrono::steady_clock::now() - it->second.cached_at >
+        std::chrono::milliseconds(ttl_ms())) {
+        g_cache.erase(it);
+        g_misses++;
+        return std::nullopt;
+    }
+    /* slot 硬校验: 用第一个 memory replica 的 offset 定位 slot */
+    const auto &replicas = it->second.replicas;
+    for (const auto &r : replicas) {
+        if (!r.is_memory_replica())
+            continue;
+        uint64_t off = (uint64_t)r.get_memory_descriptor().buffer_descriptor
+                           .buffer_address_ -
+                       g_owner_base;
+        if (off >= g_data_bytes || off % g_block != 0)
+            break;
+        kvc_slot_info_t info;
+        if (g_api.slot_query(g_region, (uint32_t)(off / g_block), &info) != 0)
+            break;
+        if (info.state != KVC_SLOT_READY ||
+            info.key_hash != it->second.key_hash ||
+            info.write_seq != it->second.write_seq) {
+            g_cache.erase(it);
+            g_invalid++;
+            return std::nullopt;
+        }
+        g_hits++;
+        return mooncake::QueryResult(
+            std::vector<Replica::Descriptor>(it->second.replicas),
+            it->second.lease_timeout, it->second.checksum);
+    }
+    g_cache.erase(it);
+    g_invalid++;
+    return std::nullopt;
+}
+
+// 新鲜 QueryResult 入缓存（仅 memory replica）
+void put(const std::string &key, const mooncake::QueryResult &qr) {
+    if (!enabled())
+        return;
+    /* 身份核验用：master 元数据里 owner 的 transport_endpoint host */
+    std::string expected_host;
+    for (const auto &r : qr.replicas) {
+        if (r.is_memory_replica()) {
+            expected_host = endpoint_host(
+                r.get_memory_descriptor().buffer_descriptor
+                    .transport_endpoint_);
+            break;
+        }
+    }
+    if (!lazy_init(expected_host))
+        return;
+    if (owner_restarted_flush())
+        return;   // 身代刚切换，qr 里的地址属新身代但缓存已清，等下次 put
+    const auto &replicas = qr.replicas;
+    for (const auto &r : replicas) {
+        if (!r.is_memory_replica())
+            continue;
+        uint64_t off = (uint64_t)r.get_memory_descriptor().buffer_descriptor
+                           .buffer_address_ -
+                       g_owner_base;
+        if (off >= g_data_bytes || off % g_block != 0)
+            return;
+        kvc_slot_info_t info;
+        if (g_api.slot_query(g_region, (uint32_t)(off / g_block), &info) != 0)
+            return;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_cache.size() > (4u << 20))
+            g_cache.clear();
+        Entry e;
+        e.replicas = qr.replicas;
+        e.lease_timeout = qr.lease_timeout;
+        e.checksum = qr.object_checksum;
+        e.key_hash = info.key_hash;
+        e.write_seq = info.write_seq;
+        e.cached_at = std::chrono::steady_clock::now();
+        g_cache[key] = std::move(e);
+        return;
+    }
+}
+// T1-3: 对象删除后, 若位置缓存有该 key 的记录 → 翻对应 slot INVALID 并清
+// 缓存。不查 master（GetReplicaList 会取读租约挡住 Remove 本身, -706）;
+// 缓存 miss 则不失效 —— 安全由 slot 复用时的 key_hash/write_seq 校验兜底。
+void invalidate_cached(const std::string &key) {
+    if (!enabled() || !lazy_init())
+        return;
+    if (owner_restarted_flush())
+        return;   // 缓存已清，slot 失效交给复用时的 key_hash 防线
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_cache.find(key);
+    if (it == g_cache.end())
+        return;
+    for (const auto &r : it->second.replicas) {
+        if (!r.is_memory_replica())
+            continue;
+        uint64_t off = (uint64_t)r.get_memory_descriptor().buffer_descriptor
+                           .buffer_address_ -
+                       g_owner_base;
+        if (off < g_data_bytes && off % g_block == 0)
+            g_api.slot_invalidate(g_region, (uint32_t)(off / g_block));
+    }
+    g_cache.erase(key);
+}
+}  // namespace
+}  // namespace kvcpos
+
+// ============================================================================
+// KVC adapter (hpc-redis kvc-sdk, P0)
+//
+// 环境变量门控:
+//   KVC_SEGMENT_DEVICE  shmdev 路径（如 /dev/obmm_shmdev1）；未设置则关闭
+//   KVC_REGION_ID       region id（默认 1）
+//   KVC_BLOCK_SIZE      定长 block（默认 4096，须 512 倍数）
+//   KVC_SDK_LIB         libkvc_server.so 路径（默认走 LD_LIBRARY_PATH）
+//
+// 行为: 段内存不再匿名分配，改为 KVC region 的数据区
+//   （region 头 + slot 元数据表留在数据区之前，对 Mooncake 不可见）。
+// master/TE/协议栈全部不动。
+// ============================================================================
+#include <dlfcn.h>
+#include "/root/gqs/codespace/UnifiedBus/hpc-redis/kvc-sdk/include/kvc/kvc_server.h"
+namespace kvc {
+namespace {
+struct Api {
+    kvc_region_t *(*open_local)(const kvc_region_config_t *);
+    void (*close)(kvc_region_t *);
+    void *(*data_base)(const kvc_region_t *);
+    uint64_t (*data_bytes)(const kvc_region_t *);
+    uint32_t (*region_id)(const kvc_region_t *);
+    int (*publish_base)(kvc_region_t *);
+    int (*probe)(const kvc_region_config_t *);
+    int (*publish_identity)(kvc_region_t *, const char *);
+    uint32_t (*recover_stale)(kvc_region_t *);   // A2: 启动期 WRITING 残留回收
+};
+Api g_api;
+kvc_region_t *g_region = nullptr;   // 进程生命周期持有，不释放
+std::string g_owner_host;           // setup 的 local_hostname（身份串左半）
+/* R1: 多段支持——Mooncake 会按 max_mr_size 把 global_segment_size 拆成
+ * 多段循环挂出。region 按【总量】建一次，每个段分到数据区互不重叠的
+ * 子区间（slot 数学: 全局 offset = buffer_address_ - owner_base，段基址
+ * 落在子区间起点，各段 slot 天然不冲突）。 */
+uint64_t g_total_seg_size = 0;      // setup 注入的全部段总量（0=未知, 单段回退）
+uint64_t g_seg_cursor = 0;          // 已切给前面段的数据区字节数
+
+// setup 挂段循环前注入总量（仅 kvc::segment_enabled() 时有意义）
+void set_total_segment_size(uint64_t total) { g_total_seg_size = total; }
+
+// owner 拓扑身份 = local_hostname（host-only）。
+// 不含设备名: 跨节点读者看到的是自己侧的远端设备号（HW02 shmdev5 ↔
+// HW01 shmdev1 是 obmm provision 映射），owner 侧设备名读者无从得知；
+// 同主机内接错设备由几何/region_id 校验兜住。
+std::string owner_identity(const char * /*device*/) {
+    char host[256] = {0};
+    if (!g_owner_host.empty()) {
+        snprintf(host, sizeof(host), "%s", g_owner_host.c_str());
+    } else {
+        gethostname(host, sizeof(host) - 1);
+    }
+    return std::string(host);
+}
+
+bool load_api() {
+    if (g_api.open_local)
+        return true;
+    const char *so = std::getenv("KVC_SDK_LIB");
+    void *h = dlopen(so ? so : "libkvc_server.so", RTLD_NOW);
+    if (!h) {
+        LOG(ERROR) << "KVC: dlopen failed: " << dlerror();
+        return false;
+    }
+    {
+        auto ver = (uint32_t (*)())dlsym(h, "kvc_api_version");
+        if (!ver || ver() != KVC_ABI_VERSION) {
+            LOG(ERROR) << "KVC: SDK ABI version mismatch — redeploy matching SDK";
+            return false;
+        }
+    }
+    g_api.open_local = (kvc_region_t * (*)(const kvc_region_config_t *))
+        dlsym(h, "kvc_region_open_local");
+    g_api.data_base =
+        (void *(*)(const kvc_region_t *))dlsym(h, "kvc_region_data_base");
+    g_api.data_bytes =
+        (uint64_t (*)(const kvc_region_t *))dlsym(h, "kvc_region_data_bytes");
+    g_api.region_id =
+        (uint32_t(*)(const kvc_region_t *))dlsym(h, "kvc_region_id");
+    g_api.publish_base =
+        (int (*)(kvc_region_t *))dlsym(h, "kvc_region_publish_base");
+    g_api.probe =
+        (int (*)(const kvc_region_config_t *))dlsym(h, "kvc_region_probe");
+    g_api.publish_identity =
+        (int (*)(kvc_region_t *, const char *))dlsym(h,
+                                                     "kvc_region_publish_identity");
+    g_api.recover_stale =
+        (uint32_t (*)(kvc_region_t *))dlsym(h, "kvc_slot_recover_stale");
+    if (!g_api.open_local || !g_api.data_base || !g_api.data_bytes ||
+        !g_api.region_id || !g_api.publish_base) {
+        LOG(ERROR) << "KVC: dlsym incomplete";
+        return false;
+    }
+    return true;
+}
+
+bool segment_enabled() { return std::getenv("KVC_SEGMENT_DEVICE") != nullptr; }
+
+// setup 时由 RealClient 注入 local_hostname（与 master 元数据里 transport_
+// endpoint 的 host 部分同源），供 owner_identity 使用
+void set_owner_host(const std::string &host) { g_owner_host = host; }
+
+// 返回数据区基址，mapped_size 设为实际挂段大小（<= 数据区大小）
+void *map_segment(size_t segment_size, size_t &mapped_size) {
+    if (!load_api()) {
+        LOG(ERROR) << "KVC: api load failed";
+        return nullptr;
+    }
+    if (g_region) {
+        // 后续分段: 从同一 region 的数据区切下一段互不重叠的子区间（R1）
+        uint64_t data_bytes = g_api.data_bytes(g_region);
+        if (g_seg_cursor + segment_size > data_bytes) {
+            LOG(ERROR) << "KVC: next segment does not fit region data area "
+                          "(cursor=" << g_seg_cursor << " + seg="
+                       << segment_size << " > data=" << data_bytes
+                       << ") — region was built for a smaller total size";
+            return nullptr;
+        }
+        void *seg_base = (char *)g_api.data_base(g_region) + g_seg_cursor;
+        g_seg_cursor += segment_size;
+        mapped_size = segment_size;
+        return seg_base;
+    }
+
+    const char *dev = std::getenv("KVC_SEGMENT_DEVICE");
+    uint32_t block = 4096, rid = 1;
+    if (const char *e = std::getenv("KVC_BLOCK_SIZE"))
+        block = (uint32_t)strtoul(e, nullptr, 0);
+    if (const char *e = std::getenv("KVC_REGION_ID"))
+        rid = (uint32_t)strtoul(e, nullptr, 0);
+
+    // region = 数据区 + slot 元数据开销（cap*24B + 64B header），对齐 block
+    // R1: 按全部段总量建（单 region 承载所有段），未知时回退本段尺寸
+    uint64_t data_budget =
+        g_total_seg_size > 0 ? g_total_seg_size : segment_size;
+    uint64_t region_bytes = data_budget + data_budget / 8 + 16384;
+    region_bytes = (region_bytes + block - 1) / block * block;
+
+    kvc_region_config_t cfg = {};
+    cfg.region_id = rid;
+    cfg.provider = KVC_PROVIDER_DEVICE;
+    snprintf(cfg.device_path, sizeof(cfg.device_path), "%s", dev);
+    cfg.bytes = region_bytes;
+    cfg.block_size = block;
+    /* 先 validate 复用既有 region（slot 状态/数据跨重启持久）。
+     * validate 失败时必须区分两种情况（防止静默摧毁既有数据）:
+     *   - 未初始化（无 magic）→ CREATE 安全
+     *   - 已初始化但几何/身份冲突 → 拒绝启动（配置错误，人为介入） */
+    cfg.flags = KVC_REGION_O_SYNC_FALLBACK;
+    g_region = g_api.open_local(&cfg);
+    if (!g_region) {
+        /* open_local 失败原因未知，用 probe 二次判定:
+           重新 mmap 只读探测 header。实现上借用 CREATE 标志位关闭的
+           open_local 已含 validate——它失败可能是未初始化或冲突。
+           这里通过 KVC_REGION_PROBE 只读路径区分（SDK 侧 probe 接口）。 */
+        int probe_rc = KVC_PROBE_CONFLICT;
+        if (g_api.probe) {
+            probe_rc = g_api.probe(&cfg);
+        }
+        if (probe_rc == KVC_PROBE_UNINITIALIZED || !g_api.probe) {
+            cfg.flags = KVC_REGION_CREATE | KVC_REGION_O_SYNC_FALLBACK;
+            g_region = g_api.open_local(&cfg);
+        } else {
+            LOG(ERROR) << "KVC: region geometry conflict on " << cfg.device_path
+                       << " (region_id=" << cfg.region_id
+                       << " block=" << cfg.block_size
+                       << " bytes=" << cfg.bytes
+                       << ") — refusing CREATE to protect existing data. "
+                          "Fix config or migrate region manually.";
+            return nullptr;
+        }
+    }
+    if (!g_region) {
+        LOG(ERROR) << "KVC: open_local failed (dev=" << dev
+                   << " bytes=" << region_bytes << ")";
+        return nullptr;
+    }
+    uint64_t data_bytes = g_api.data_bytes(g_region);
+    /* A2: 启动期残留回收——单写者假设下, daemon 启动时无写入者存活,
+     * 所有 WRITING 残留（上次 kill -9 / PutRevoke 泄漏）判死回收为 FREE。
+     * 必须先于身份/基址发布（读者看到新 epoch 即认为新 owner 已完成恢复）。 */
+    if (g_api.recover_stale) {
+        uint32_t recovered = g_api.recover_stale(g_region);
+        if (recovered > 0)
+            LOG(INFO) << "KVC: startup recovery reclaimed " << recovered
+                      << " stale WRITING slot(s) on region "
+                      << g_api.region_id(g_region);
+    }
+    g_api.publish_base(g_region);   // 供写端进程做 buffer_address_ offset 换算
+    if (g_api.publish_identity)     // T0-1: 拓扑身份发布（epoch++ = owner 重启身代）
+        g_api.publish_identity(g_region, owner_identity(dev).c_str());
+    LOG(INFO) << "KVC: region " << g_api.region_id(g_region)
+              << " dev=" << dev << " block=" << block
+              << " data_bytes=" << data_bytes;
+    if (segment_size > data_bytes) {
+        LOG(ERROR) << "KVC: data_bytes " << data_bytes << " < segment_size "
+                   << segment_size;
+        return nullptr;
+    }
+    g_seg_cursor = segment_size;   // R1: 首段占据数据区 [0, segment_size)
+    mapped_size = segment_size;
+    return g_api.data_base(g_region);
+}
+}  // namespace
+}  // namespace kvc
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -617,6 +1197,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
     this->protocol = protocol;
+    if (kvc::segment_enabled())
+        kvc::set_owner_host(local_hostname);   // T0-1: 身份串与 master 元数据同源
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
         use_hugepage_ && this->protocol != "ubshmem";
@@ -788,6 +1370,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
+        if (kvc::segment_enabled())
+            kvc::set_total_segment_size(global_segment_size);   // KVC R1
 
         // For RDMA, auto-discover NUMA nodes with NICs and distribute
         // global_segment across them for full NIC utilization.
@@ -844,6 +1428,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     mapped_size = actual_size;
                 }
 #endif
+            } else if (kvc::segment_enabled()) {
+                // KVC adapter: 段内存 = KVC region 数据区
+                ptr = kvc::map_segment(segment_size, mapped_size);
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -872,7 +1459,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
-            } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
+            } else if (!seg_numa_nodes.empty() || should_use_hugepage ||
+                       kvc::segment_enabled()) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
@@ -2063,6 +2651,7 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
+    kvcpos::invalidate_cached(key);   // KVC T1-3: 缓存位置翻 INVALID
     return {};
 }
 
@@ -2664,8 +3253,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // Query the object info
-    auto query_result = client_->Query(key);
+    // Query the object info（P2b: 位置缓存优先; QueryResult 禁赋值 → 三元一次构造）
+    auto cached = kvcpos::try_get(key);
+    tl::expected<QueryResult, ErrorCode> query_result =
+        cached ? tl::expected<QueryResult, ErrorCode>(std::move(*cached))
+               : client_->Query(key);
+    if (query_result && !cached) {
+        kvcpos::put(key, query_result.value());
+    }
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -2998,8 +3593,35 @@ RealClient::batch_get_buffer_internal(
         return final_results;
     }
 
-    // 1. Query metadata for all keys
-    auto query_results = client_->BatchQuery(keys);
+    // 1. Query metadata for all keys（P2b: 位置缓存优先, 命中跳过 master RPC）
+    std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+    {
+        std::vector<std::optional<QueryResult>> cached;
+        cached.reserve(keys.size());
+        std::vector<std::string> miss_keys;
+        std::vector<size_t> miss_idx;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            cached.emplace_back(kvcpos::try_get(keys[i]));  // 仅构造, 无赋值
+            if (!cached[i]) {
+                miss_keys.push_back(keys[i]);
+                miss_idx.push_back(i);
+            }
+        }
+        auto fresh = miss_keys.empty()
+                         ? std::vector<tl::expected<QueryResult, ErrorCode>>{}
+                         : client_->BatchQuery(miss_keys);
+        query_results.reserve(keys.size());
+        for (size_t i = 0, m = 0; i < keys.size(); ++i) {
+            if (cached[i]) {
+                query_results.emplace_back(std::move(*cached[i]));
+            } else {
+                if (fresh[m]) {
+                    kvcpos::put(keys[i], fresh[m].value());
+                }
+                query_results.emplace_back(std::move(fresh[m++]));
+            }
+        }
+    }
 
     // 2. Prepare for batch get: filter valid keys and prepare buffers
     struct KeyOp {
@@ -3306,8 +3928,22 @@ RealClient::resolve_ranged_read_metadata(
                                                                 cached->second);
         }
     }
+    /* KVC P2b: 位置缓存优先（get_into/ranged 路径此前未挂, 导致
+     * invalidate_cached 拿不到位置 → remove 联动失效）。 */
+    {
+        auto kvc_cached = kvcpos::try_get(key);
+        if (kvc_cached) {
+            return build_ranged_read_metadata_from_query_result(
+                key, tl::expected<QueryResult, ErrorCode>(
+                         std::move(*kvc_cached)));
+        }
+    }
+    auto fresh = client_->Query(key);
+    if (fresh) {
+        kvcpos::put(key, fresh.value());
+    }
     return build_ranged_read_metadata_from_query_result(key,
-                                                        client_->Query(key));
+                                                        std::move(fresh));
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(

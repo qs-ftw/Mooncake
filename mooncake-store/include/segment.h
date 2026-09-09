@@ -3,6 +3,8 @@
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <map>
+#include <memory>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <shared_mutex>
@@ -597,5 +599,24 @@ class NoFSegmentManager {
     friend class ScopedNoFSegmentAccess;
     friend class SegmentTest;
 };
+
+// ============================================================================
+// KVC (hpc-redis kvc-sdk) master 侧辅助
+// ============================================================================
+
+// KvcSlotAllocator 生效的 block size（env KVC_MASTER_BLOCK_SIZE，0=关闭）
+size_t kvc_master_block_size();
+
+// daemon 重挂段时从持久化的 replica descriptors 重建 KvcSlotAllocator 位图
+// （A2: master 侧重启恢复）。任一 descriptor 几何不符（size≠block / 未对齐
+// / slot 重复）→ nullopt（fail_remount，宁拒不错）。
+struct RestoredKvcAllocator {
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+};
+std::optional<RestoredKvcAllocator> RestoreKvcSlotAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<AllocatedBuffer::Descriptor>& descriptors);
 
 }  // namespace mooncake

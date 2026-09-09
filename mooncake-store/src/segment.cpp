@@ -8,6 +8,138 @@
 namespace mooncake {
 namespace {
 
+// ============================================================================
+// KvcSlotAllocator (hpc-redis kvc-sdk 对接, P2d)
+//
+// 定长 slot 位图分配器，替代 KVC 段上的 OffsetBufferAllocator：
+//   offset = slot_idx * block_size —— 与 kvc-sdk 的 slot 状态机严格一一对应，
+//   消除 512 对齐导致的跨 slot 对象（直读回退的根源）。
+//
+// 激活: master 环境变量 KVC_MASTER_BLOCK_SIZE=<block>（如 4096）。
+// 约束（P2d 范围）: 仅支持 size == block_size 的分配（KV block 语义）；
+//   其他 size 分配失败（返回 nullptr）。适用于 value_size == block 的部署。
+// ============================================================================
+class KvcSlotAllocator
+    : public BufferAllocatorBase,
+      public std::enable_shared_from_this<KvcSlotAllocator> {
+   public:
+    KvcSlotAllocator(std::string segment_name, size_t base, size_t size,
+                     std::string transport_endpoint, size_t block_size)
+        : segment_name_(std::move(segment_name)),
+          base_(base),
+          total_size_(size),
+          block_size_(block_size),
+          transport_endpoint_(std::move(transport_endpoint)) {
+        capacity_slots_ = total_size_ / block_size_;
+        uint64_t words = (capacity_slots_ + 63) / 64;
+        bitmap_.assign(words, 0);
+        LOG(INFO) << "kvc_slot_allocator segment=" << segment_name_
+                  << " base=0x" << std::hex << base_ << std::dec
+                  << " size=" << total_size_ << " block=" << block_size_
+                  << " slots=" << capacity_slots_;
+    }
+
+    ~KvcSlotAllocator() override {
+        // total capacity 的增减由 MountSegment/Unmount 路径管理;
+        // 此处仅清理已分配口径（镜像 OffsetBufferAllocator）
+        MasterMetricManager::instance().dec_allocated_mem_size(
+            segment_name_, (size_t)used_.load() * block_size_);
+    }
+
+    // R3: 支持任意 k*block 尺寸（k 个连续 slot）。仍拒绝非 block 整数倍
+    // 的尺寸——几何上无法落进定长 slot 语义（直读/flip 换算的前提）。
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+        if (size == 0 || size % block_size_ != 0) {
+            VLOG(1) << "kvc_slot_alloc_rejected size=" << size
+                    << " (block=" << block_size_ << ") segment="
+                    << segment_name_;
+            return nullptr;
+        }
+        const uint32_t k = (uint32_t)(size / block_size_);
+        std::lock_guard<std::mutex> lock(mutex_);
+        // first-fit: 找 k 个连续 0 bit
+        uint64_t run = 0;
+        for (uint64_t idx = 0; idx < capacity_slots_; idx++) {
+            if (bitmap_[idx / 64] & (1ULL << (idx % 64))) {
+                run = 0;
+                continue;
+            }
+            if (++run == k) {
+                uint32_t slot = (uint32_t)(idx + 1 - k);
+                for (uint32_t j = slot; j <= (uint32_t)idx; j++)
+                    bitmap_[j / 64] |= 1ULL << (j % 64);
+                used_.fetch_add(k);
+                size_t offset = (size_t)slot * block_size_;
+                MasterMetricManager::instance().inc_allocated_mem_size(
+                    segment_name_, size);
+                return std::make_unique<AllocatedBuffer>(
+                    shared_from_this(), (void *)(base_ + offset), size,
+                    std::nullopt);
+            }
+        }
+        return nullptr;   // 无连续空间
+    }
+
+    void deallocate(AllocatedBuffer* handle) override {
+        if (!handle)
+            return;
+        size_t offset = (uintptr_t)handle->data() - base_;
+        if (offset % block_size_ != 0 || handle->size() % block_size_ != 0) {
+            LOG(ERROR) << "kvc_slot_free_misaligned segment=" << segment_name_;
+            return;
+        }
+        uint32_t slot = (uint32_t)(offset / block_size_);
+        uint32_t k = (uint32_t)(handle->size() / block_size_);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (slot + k > capacity_slots_ ||
+            (bitmap_[slot / 64] & (1ULL << (slot % 64))) == 0) {
+            LOG(ERROR) << "kvc_slot_free_invalid slot=" << slot;
+            return;
+        }
+        for (uint32_t j = slot; j < slot + k; j++)
+            bitmap_[j / 64] &= ~(1ULL << (j % 64));
+        used_.fetch_sub(k);
+        MasterMetricManager::instance().dec_allocated_mem_size(
+            segment_name_, handle->size());
+    }
+
+    size_t capacity() const override { return total_size_; }
+    size_t size() const override {
+        return (size_t)used_.load() * block_size_;
+    }
+    std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+    size_t getLargestFreeRegion() const override {
+        return used_.load() < capacity_slots_ ? block_size_ : 0;  // best-effort
+    }
+
+    // A2 重挂恢复: 预标一个已占用 slot；slot 已被标记返回 false（元数据矛盾）
+    bool restore_mark(uint32_t slot) {
+        uint64_t& word = bitmap_[slot / 64];
+        const uint64_t bit = 1ULL << (slot % 64);
+        if (word & bit)
+            return false;
+        word |= bit;
+        used_.fetch_add(1);
+        return true;
+    }
+
+    uint32_t slot_capacity() const { return capacity_slots_; }
+
+   private:
+    std::string segment_name_;
+    size_t base_;
+    size_t total_size_;
+    size_t block_size_;
+    size_t capacity_slots_;
+    std::string transport_endpoint_;
+    std::vector<uint64_t> bitmap_;
+    std::atomic<uint64_t> used_{0};
+    std::mutex mutex_;
+};
+
 bool HasAllocator(const AllocatorManager& allocator_manager,
                   const std::string& segment_name,
                   const std::shared_ptr<BufferAllocatorBase>& allocator) {
@@ -185,8 +317,14 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                     segment.name, buffer, size, segment.te_endpoint);
                 break;
             case BufferAllocatorType::OFFSET:
-                allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
+                if (kvc_master_block_size() > 0) {   // KVC P2d: 定长 slot 分配器
+                    allocator = std::make_shared<KvcSlotAllocator>(
+                        segment.name, buffer, size, segment.te_endpoint,
+                        kvc_master_block_size());
+                } else {
+                    allocator = std::make_shared<OffsetBufferAllocator>(
+                        segment.name, buffer, size, segment.te_endpoint);
+                }
                 break;
             default:
                 LOG(ERROR) << "segment_name=" << segment.name
@@ -1644,4 +1782,61 @@ bool SegmentManager::GetSegmentBasicInfo(const UUID& segment_id,
     te_endpoint = seg.te_endpoint;
     return true;
 }
+
+// ============================================================================
+// KVC master 侧公开入口（声明见 segment.h）
+// ============================================================================
+
+size_t kvc_master_block_size() {
+    static size_t cached = []() -> size_t {
+        const char* e = std::getenv("KVC_MASTER_BLOCK_SIZE");
+        return e ? strtoull(e, nullptr, 0) : 0;
+    }();
+    return cached;
+}
+
+std::optional<RestoredKvcAllocator> RestoreKvcSlotAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<AllocatedBuffer::Descriptor>& descriptors) {
+    const size_t block = kvc_master_block_size();
+    if (block == 0) {
+        return std::nullopt;
+    }
+    auto allocator = std::make_shared<KvcSlotAllocator>(
+        segment_name, base, size, transport_endpoint, block);
+    RestoredKvcAllocator restored{allocator, {}};
+    restored.buffers.reserve(descriptors.size());
+    for (const auto& descriptor : descriptors) {
+        if (descriptor.size_ != block) {
+            LOG(ERROR) << "kvc_restore_rejected size=" << descriptor.size_
+                       << " (block=" << block << ") segment=" << segment_name;
+            return std::nullopt;
+        }
+        const size_t offset = (uintptr_t)descriptor.buffer_address_ - base;
+        if (descriptor.buffer_address_ < base || offset >= size ||
+            offset % block != 0) {
+            LOG(ERROR) << "kvc_restore_rejected unaligned/out-of-range offset=0x"
+                       << std::hex << offset << std::dec << " segment="
+                       << segment_name;
+            return std::nullopt;
+        }
+        const uint32_t slot = (uint32_t)(offset / block);
+        if (!allocator->restore_mark(slot)) {   // slot 重复 = 元数据自相矛盾
+            LOG(ERROR) << "kvc_restore_rejected duplicate slot=" << slot
+                       << " segment=" << segment_name;
+            return std::nullopt;
+        }
+        restored.buffers.push_back(std::make_unique<AllocatedBuffer>(
+            allocator, (void *)(uintptr_t)descriptor.buffer_address_,
+            descriptor.size_, std::nullopt));
+    }
+    LOG(INFO) << "kvc_slot_allocator restored segment=" << segment_name
+              << " base=0x" << std::hex << base << std::dec
+              << " size=" << size << " block=" << block
+              << " slots=" << allocator->slot_capacity()
+              << " restored_objects=" << descriptors.size();
+    return restored;
+}
+
 }  // namespace mooncake

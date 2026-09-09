@@ -8,7 +8,12 @@
 #include "segment.h"
 
 #include <csignal>
+#include "crc_checksum.h"
 #include <algorithm>
+#include <array>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -38,6 +43,636 @@
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.h"
+
+// ============================================================================
+// KVC slot-state flip adapter (hpc-redis kvc-sdk, P1)
+//
+// 把 Mooncake 写路径语义落到 KVC region 的 slot 状态机:
+//   PutStart 成功   → mark_writing（分配到的 offset 对应 slot）
+//   TransferWrite 成功 → mark_ready（release 语义发布, peer 可见）
+//
+// 环境变量门控（未设置则完全旁路, 零开销）:
+//   KVC_FLIP_DEVICE   shmdev 路径（写端自行 open 映射同一 region, validate 模式）
+//   KVC_FLIP_BLOCK    block size（可选; 仅作断言, 权威值来自 region header）
+//   KVC_FLIP_BYTES    region 总字节（可选; 仅作断言, 权威值来自 region header）
+//   T0-1: 几何/owner 身份自 shm header 自描述读取，与 master 元数据
+//         （transport_endpoint host）交叉核验；不符 → T0-2 永久降级全走 TE
+//
+// slot 数学: replica.buffer_descriptor.buffer_address_ 即段内 offset（TE
+// target_offset 同源）, slot_idx = offset / block。仅对单 slice 且
+// offset 对齐 block 的对象生效（P1 约束）。
+// ============================================================================
+#include <dlfcn.h>
+#include "/root/gqs/codespace/UnifiedBus/hpc-redis/kvc-sdk/include/kvc/kvc_server.h"
+namespace kvcflip {
+namespace {
+struct Api {
+    kvc_region_t *(*open_local)(const kvc_region_config_t *);
+    void (*close)(kvc_region_t *);
+    int (*mark_writing)(kvc_region_t *, uint32_t, uint64_t);
+    int (*mark_ready)(kvc_region_t *, uint32_t);
+    uint64_t (*owner_base)(const kvc_region_t *);
+    uint64_t (*data_bytes)(const kvc_region_t *);
+    void *(*data_base)(const kvc_region_t *);
+    int (*slot_query)(const kvc_region_t *, uint32_t, void *);
+    int (*slot_invalidate)(kvc_region_t *, uint32_t);
+    int (*probe_identity)(const char *, uint64_t, uint32_t,
+                          kvc_region_meta_t *, uint64_t *, uint32_t *);
+    uint64_t (*identity_hash)(const char *);
+    uint32_t (*owner_epoch)(const kvc_region_t *);
+};
+Api g_api;
+kvc_region_t *g_region = nullptr;
+bool g_init_failed = false;   // 一次性放弃标志: 失败后不再重试, 全走 TE
+char g_disable_reason[512];   // 永久降级原因（观测/门禁判定用）
+uint32_t g_block = 0;
+uint64_t g_owner_base = 0, g_data_bytes = 0;
+uint32_t g_epoch = 0;         // lazy_init/refresh 时的 owner 身代快照
+const char *g_data_base_local = nullptr;   // 本进程映射的数据区基址
+uint64_t g_flip_count = 0, g_flip_fail = 0, g_direct_count = 0, g_direct_fallback = 0;
+uint64_t g_guard_rejects = 0;   // 读后校验拦截数（观测用）
+uint64_t g_epoch_refresh = 0;   // owner 重启身代刷新计数（观测用）
+uint64_t g_checksum_rejects = 0;   // R5: 直读 checksum 不符回退 TE 的次数
+uint64_t g_crc_verified_hits = 0;   // R5 策略4: 首验标记命中（免 CRC）次数
+
+/* R8: 周期性计数器出口（60s 一条 LOG(INFO)，回答"直读为什么没生效/
+ * 为什么回退"）。热路径只付一次 time(nullptr) 比较。 */
+inline void metrics_tick() {
+    static time_t last = 0;
+    time_t now = ::time(nullptr);
+    if (now - last < 60)
+        return;
+    last = now;
+    if (g_init_failed)
+        LOG(INFO) << "KVC-FLIP metrics: disabled=1 reason=\"" << g_disable_reason
+                  << "\" flip_ok=" << g_flip_count
+                  << " flip_fail=" << g_flip_fail
+                  << " direct_ok=" << g_direct_count
+                  << " direct_fallback=" << g_direct_fallback
+                  << " guard_rejects=" << g_guard_rejects
+                  << " checksum_rejects=" << g_checksum_rejects
+                  << " crc_verified_hits=" << g_crc_verified_hits
+                  << " epoch_refresh=" << g_epoch_refresh;
+    else
+        LOG(INFO) << "KVC-FLIP metrics: disabled=0"
+                  << " flip_ok=" << g_flip_count
+                  << " flip_fail=" << g_flip_fail
+                  << " direct_ok=" << g_direct_count
+                  << " direct_fallback=" << g_direct_fallback
+                  << " guard_rejects=" << g_guard_rejects
+                  << " checksum_rejects=" << g_checksum_rejects
+                  << " crc_verified_hits=" << g_crc_verified_hits
+                  << " epoch_refresh=" << g_epoch_refresh;
+}
+
+
+bool enabled() { return std::getenv("KVC_FLIP_DEVICE") != nullptr; }
+
+bool direct_enabled() {
+    return enabled() && std::getenv("KVC_DIRECT_READ") != nullptr;
+}
+
+// R5: 直读后做内容级 checksum 校验（对齐 TE 路径的证据链）。
+// 默认关。两级降代价:
+//   策略3: slice-by-8 CRC-64/ECMA（与 mooncake::CrcChecksum 逐位等价,
+//          启动时自校验, 不等即回退逐字节实现）—— 8 字节/步 ~8× 提速
+//   策略4: 首验标记（key → 已验 checksum 值）, 后续读仅比对期望值,
+//          CRC 摊薄到每对象一次; epoch 切换/覆写(checksum 变化)自动重验
+bool direct_checksum_enabled() {
+    return enabled() && std::getenv("KVC_DIRECT_CHECKSUM") != nullptr;
+}
+
+/* ---- slice-by-8 CRC-64/ECMA（MSB-first, 与 CrcChecksum 逐位等价） ---- */
+namespace fastcrc64 {
+constexpr uint64_t kPoly = 0x42F0E1EBA9EA3693ULL;
+constexpr auto MakeTable() {
+    std::array<uint64_t, 256> t{};
+    for (size_t i = 0; i < 256; i++) {
+        uint64_t c = (uint64_t)i << 56;
+        for (int b = 0; b < 8; b++)
+            c = (c & (1ULL << 63)) ? (c << 1) ^ kPoly : (c << 1);
+        t[i] = c;
+    }
+    return t;
+}
+constexpr auto MakeTables() {
+    std::array<std::array<uint64_t, 256>, 8> ts{};
+    ts[0] = MakeTable();
+    for (size_t k = 1; k < 8; k++)
+        for (size_t i = 0; i < 256; i++)
+            ts[k][i] = ts[0][ts[k-1][i] >> 56] ^ (ts[k-1][i] << 8);
+    return ts;
+}
+constexpr auto kTables = MakeTables();
+}  // namespace fastcrc64
+
+struct FastCrc64 {
+
+    uint64_t crc_ = 0;
+    void Update(const void* data, size_t size) {
+        const uint8_t* p = (const uint8_t*)data;
+        while (size >= 8) {
+            uint64_t n;
+            memcpy(&n, p, 8);
+            n = __builtin_bswap64(n) ^ crc_;
+            crc_ = fastcrc64::kTables[7][n & 0xff] ^ fastcrc64::kTables[6][(n >> 8) & 0xff] ^
+                   fastcrc64::kTables[5][(n >> 16) & 0xff] ^ fastcrc64::kTables[4][(n >> 24) & 0xff] ^
+                   fastcrc64::kTables[3][(n >> 32) & 0xff] ^ fastcrc64::kTables[2][(n >> 40) & 0xff] ^
+                   fastcrc64::kTables[1][(n >> 48) & 0xff] ^ fastcrc64::kTables[0][n >> 56];
+            p += 8; size -= 8;
+        }
+        while (size--) {
+            crc_ = (crc_ << 8) ^ fastcrc64::kTables[0][(crc_ >> 56) ^ *p++];
+        }
+    }
+    uint64_t Finalize() const { return crc_; }
+};
+
+/* 首验标记表: key → 已验证的 checksum 值（策略4） */
+std::unordered_map<std::string, uint64_t> g_crc_verified;
+std::mutex g_crc_mutex;
+
+/* 自校验: 快速实现与上游 CrcChecksum 逐位等价才启用（一次性） */
+bool fast_crc_validated() {
+    static bool ok = [] {
+        char buf[4096];
+        for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (char)(i * 131 + 7);
+        FastCrc64 fast;
+        fast.Update(buf, sizeof(buf));
+        return fast.Finalize() == mooncake::ComputeCrcChecksum(buf, sizeof(buf));
+    }();
+    return ok;
+}
+
+/* 直读校验入口: 期望值命中首验标记 → 免 CRC; 否则全量快算。
+ * 返回 true = 校验通过（或无期望值）; false = 不符（调用方回退 TE）。 */
+inline bool direct_checksum_ok(const std::string& key,
+                               const std::vector<mooncake::Slice>& slices,
+                               const std::optional<uint64_t>& expected) {
+    if (!expected.has_value())
+        return true;   // 无期望值（put 时未开 checksum）: 与 TE 路径同语义
+    {
+        std::lock_guard<std::mutex> lock(g_crc_mutex);
+        auto it = g_crc_verified.find(key);
+        if (it != g_crc_verified.end() && it->second == *expected) {
+            g_crc_verified_hits++;
+            return true;   // 同一 checksum 已全量验过
+        }
+    }
+    if (fast_crc_validated()) {
+        FastCrc64 crc;
+        for (const auto& sl : slices)
+            crc.Update(sl.ptr, sl.size);
+        if (crc.Finalize() != *expected) {
+            if (std::getenv("KVC_DEBUG_DIRECT")) {
+                /* ④取证: 校验失败现场 —— 区分"读错 slot"vs"同 slot 旧内容" */
+                const auto& sl0 = slices.front();
+                uint64_t addr = (uint64_t)(uintptr_t)sl0.ptr;
+                LOG(ERROR) << "KVC-DIRECT-DEBUG key=" << key
+                           << " expected_crc=" << *expected
+                           << " actual_crc=" << crc.Finalize()
+                           << " dst_ptr=0x" << std::hex << addr << std::dec
+                           << " first16=" << std::hex
+                           << *(const uint64_t *)sl0.ptr
+                           << *(const uint64_t *)((const char *)sl0.ptr + 8)
+                           << std::dec;
+            }
+            return false;
+        }
+    } else {
+        mooncake::CrcChecksum slow;
+        for (const auto& sl : slices)
+            slow.Update(sl.ptr, sl.size);
+        if (slow.Finalize() != *expected)
+            return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_crc_mutex);
+        if (g_crc_verified.size() > (1u << 20))
+            g_crc_verified.clear();   // 上限防膨胀（与 poscache 同策略）
+        g_crc_verified[key] = *expected;
+    }
+    return true;
+}
+
+
+
+// 永久禁用（T0-2）: 一次性告警（含原因与 env 快照），此后本进程全走 TE
+void disable(const std::string &reason) {
+    if (!g_init_failed)
+        LOG(ERROR) << "KVC-FLIP: PERMANENTLY DISABLED — " << reason
+                   << " [env: KVC_FLIP_DEVICE="
+                   << (std::getenv("KVC_FLIP_DEVICE") ? std::getenv("KVC_FLIP_DEVICE") : "<unset>")
+                   << " KVC_FLIP_BYTES="
+                   << (std::getenv("KVC_FLIP_BYTES") ? std::getenv("KVC_FLIP_BYTES") : "<unset>")
+                   << " KVC_FLIP_BLOCK="
+                   << (std::getenv("KVC_FLIP_BLOCK") ? std::getenv("KVC_FLIP_BLOCK") : "<unset>")
+                   << "] — all reads/writes fall back to TransferEngine";
+    snprintf(g_disable_reason, sizeof(g_disable_reason), "%s",
+             reason.c_str());
+    g_init_failed = true;
+}
+
+// transport_endpoint（"tcp://host:port" / "rdma://..."）→ host 串。
+// 与 owner 端 owner_identity（host-only，不含设备名——远端读者设备号不同）同源。
+inline std::string endpoint_host(const std::string &ep) {
+    auto scheme = ep.find("://");
+    size_t beg = scheme == std::string::npos ? 0 : scheme + 3;
+    auto colon = ep.find(':', beg);
+    return ep.substr(beg, colon == std::string::npos ? std::string::npos
+                                                     : colon - beg);
+}
+
+bool lazy_init(const std::string &expected_host = std::string()) {
+    if (g_region)
+        return true;
+    if (g_init_failed)
+        return false;   // 已判定不可用（配置错/设备缺失），避免每请求重试
+    void *h = dlopen(std::getenv("KVC_SDK_LIB") ? std::getenv("KVC_SDK_LIB")
+                                                : "libkvc_server.so",
+                     RTLD_NOW);
+    if (!h) {
+        disable((std::string("dlopen failed: ") + dlerror()).c_str());
+        return false;
+    }
+    {
+        auto ver = (uint32_t (*)())dlsym(h, "kvc_api_version");
+        if (!ver || ver() != KVC_ABI_VERSION) {
+            disable(ver ? "SDK ABI version mismatch — redeploy matching SDK"
+                        : "SDK missing kvc_api_version — redeploy matching SDK");
+            return false;
+        }
+    }
+    g_api.open_local = (kvc_region_t * (*)(const kvc_region_config_t *))
+        dlsym(h, "kvc_region_open_local");
+    g_api.mark_writing =
+        (int (*)(kvc_region_t *, uint32_t, uint64_t))dlsym(h,
+                                                           "kvc_slot_mark_writing");
+    g_api.mark_ready =
+        (int (*)(kvc_region_t *, uint32_t))dlsym(h, "kvc_slot_mark_ready");
+    g_api.owner_base =
+        (uint64_t(*)(const kvc_region_t *))dlsym(h, "kvc_region_owner_base");
+    g_api.data_bytes =
+        (uint64_t(*)(const kvc_region_t *))dlsym(h, "kvc_region_data_bytes");
+    g_api.data_base =
+        (void *(*)(const kvc_region_t *))dlsym(h, "kvc_region_data_base");
+    g_api.slot_query =
+        (int (*)(const kvc_region_t *, uint32_t, void *))dlsym(h,
+                                                               "kvc_slot_query");
+    g_api.slot_invalidate =
+        (int (*)(kvc_region_t *, uint32_t))dlsym(h, "kvc_slot_invalidate");
+    g_api.probe_identity =
+        (int (*)(const char *, uint64_t, uint32_t, kvc_region_meta_t *,
+                 uint64_t *, uint32_t *))dlsym(h, "kvc_region_probe_identity");
+    g_api.identity_hash =
+        (uint64_t (*)(const char *))dlsym(h, "kvc_identity_hash");
+    g_api.owner_epoch =
+        (uint32_t (*)(const kvc_region_t *))dlsym(h, "kvc_region_owner_epoch");
+    if (!g_api.open_local || !g_api.mark_writing || !g_api.mark_ready ||
+        !g_api.owner_base || !g_api.data_bytes || !g_api.data_base ||
+        !g_api.slot_query || !g_api.slot_invalidate ||
+        !g_api.probe_identity || !g_api.identity_hash || !g_api.owner_epoch) {
+        disable("dlsym incomplete (SDK ABI mismatch — rebuild/redeploy SDK)");
+        return false;
+    }
+
+    const char *dev = std::getenv("KVC_FLIP_DEVICE");
+    if (!dev)   // C2: daemon 进程（驱逐推送执行端）只有 KVC_SEGMENT_DEVICE
+        dev = std::getenv("KVC_SEGMENT_DEVICE");
+
+    /* T0-1 几何自读: header 是权威，env 只作断言（配错即拒绝） */
+    kvc_region_meta_t geo = {};
+    uint64_t host_id = 0;
+    uint32_t epoch = 0;
+    int prc = g_api.probe_identity(dev, 0, KVC_REGION_O_SYNC_FALLBACK, &geo,
+                                   &host_id, &epoch);
+    if (prc == KVC_ENOENT) {
+        disable("device has no KVC region (wrong device or owner never "
+                "initialized)");
+        return false;
+    }
+    if (prc != KVC_OK) {
+        disable("region header corrupt/geometry inconsistent — wrong device?");
+        return false;
+    }
+    if (const char *e = std::getenv("KVC_FLIP_BYTES")) {
+        uint64_t want = strtoull(e, nullptr, 0);
+        if (want != geo.data_bytes + geo.data_off) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "KVC_FLIP_BYTES=%llu mismatches region header "
+                     "(header total=%llu) — fix env or unset it",
+                     (unsigned long long)want,
+                     (unsigned long long)(geo.data_bytes + geo.data_off));
+            disable(buf);
+            return false;
+        }
+    }
+    if (const char *e = std::getenv("KVC_FLIP_BLOCK")) {
+        uint32_t want = (uint32_t)strtoul(e, nullptr, 0);
+        if (want != geo.block_size) {
+            char buf[192];
+            snprintf(buf, sizeof(buf),
+                     "KVC_FLIP_BLOCK=%u mismatches region header (block=%u)",
+                     want, geo.block_size);
+            disable(buf);
+            return false;
+        }
+    }
+
+    /* T0-1 身份核验: shm 自描述 vs master 元数据（transport_endpoint host） */
+    if (host_id != 0 && !expected_host.empty()) {
+        if (g_api.identity_hash(expected_host.c_str()) != host_id) {
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                     "owner identity mismatch: region claims host-hash 0x%llx, "
+                     "master metadata says '%s' — wrong device mapping?",
+                     (unsigned long long)host_id, expected_host.c_str());
+            disable(buf);
+            return false;
+        }
+    }
+
+    kvc_region_config_t cfg = {};
+    cfg.region_id = geo.region_id;
+    cfg.provider = KVC_PROVIDER_DEVICE;
+    snprintf(cfg.device_path, sizeof(cfg.device_path), "%s", dev);
+    cfg.block_size = geo.block_size;
+    cfg.bytes = geo.data_bytes + geo.data_off;   // 权威几何，来自 header
+    cfg.flags = KVC_REGION_O_SYNC_FALLBACK;      // validate 模式, 不 CREATE
+
+    g_region = g_api.open_local(&cfg);
+    if (!g_region) {
+        disable("open region failed after probe (concurrent re-init?)");
+        return false;
+    }
+    g_owner_base = g_api.owner_base(g_region);
+    g_data_bytes = g_api.data_bytes(g_region);
+    g_epoch = g_api.owner_epoch(g_region);
+    g_block = geo.block_size;
+    if (g_owner_base == 0) {
+        disable("owner base not published (segment owner must be up first)");
+        return false;
+    }
+    g_data_base_local = (const char *)g_api.data_base(g_region);
+    LOG(INFO) << "KVC-FLIP: region mapped for state flips (block="
+              << cfg.block_size << " bytes=" << cfg.bytes << " owner_base=0x"
+              << std::hex << g_owner_base << std::dec
+              << " owner_epoch=" << g_epoch << " identity=0x" << std::hex
+              << host_id << std::dec << ")";
+    return true;
+}
+
+/* T0-1/R2 epoch 复查（命中路径调用，单 acquire load）:
+ * owner 重启（epoch 变化）→ 刷新 owner_base/epoch；刷新失败才降级。
+ * 返回 false = 继续正常路径；true = 本次操作放弃（调用方走 TE）。 */
+inline bool owner_restarted() {
+    if (!g_region)
+        return false;
+    uint32_t e = g_api.owner_epoch(g_region);
+    if (e == g_epoch)
+        return false;
+    uint64_t base = g_api.owner_base(g_region);
+    if (base == 0) {
+        disable("owner restarted and has not republished base");
+        return true;
+    }
+    g_owner_base = base;   /* 身代切换: 新 owner_base 立即生效 */
+    g_epoch = e;
+    g_epoch_refresh++;
+    {
+        /* R5: owner 重启后数据可能被重写, 首验标记全部作废 */
+        std::lock_guard<std::mutex> lock(g_crc_mutex);
+        g_crc_verified.clear();
+    }
+    return false;
+}
+
+inline uint64_t fnv1a(const std::string &s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (char c : s) {
+        h ^= (unsigned char)c;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// 对象覆盖的 slot 区间（R3: 支持任意 k*block 尺寸, 不再定长-only）。
+// 返回 false = 几何不符（未对齐/越界/非整 block）。
+inline bool slot_range(const mooncake::AllocatedBuffer::Descriptor &handle,
+                       uint32_t *first, uint32_t *last) {
+    uint64_t off = (uint64_t)handle.buffer_address_ - g_owner_base;
+    uint64_t size = handle.size_;
+    if (off >= g_data_bytes || off % g_block != 0 || size == 0 ||
+        size % g_block != 0 || off + size > g_data_bytes)
+        return false;
+    *first = (uint32_t)(off / g_block);
+    *last = (uint32_t)((off + size - 1) / g_block);
+    return true;
+}
+
+// flip(replica, writing): 取 memory replica 的段内 offset 换算 slot 区间并
+// 逐 slot 翻转状态（R3: k*block 对象翻转 k 个 slot）。
+// 返回首 slot（0xffffffff = 未翻转）。batch 路径把返回的 slot 存进
+// PendingTransferRecord, 传输完成后用 ready_slot() 发布。
+inline uint32_t flip(const mooncake::Replica::Descriptor &replica,
+                     const std::string &key, bool writing) {
+    if (!enabled() || !replica.is_memory_replica())
+        return 0xffffffffu;
+    const auto &handle0 = replica.get_memory_descriptor().buffer_descriptor;
+    if (!lazy_init(endpoint_host(handle0.transport_endpoint_)))
+        return 0xffffffffu;
+    if (owner_restarted())
+        return 0xffffffffu;
+    metrics_tick();
+    const auto &handle = replica.get_memory_descriptor().buffer_descriptor;
+    /* buffer_address_ 是段 owner 进程的绝对 VA（TCP transport 在目标侧直接
+     * 解引用）；用 owner 发布的 data_base 换算成段内 offset。 */
+    uint32_t first, last;
+    if (!slot_range(handle, &first, &last)) {
+        g_flip_fail++;
+        return 0xffffffffu;
+    }
+    uint64_t key_hash = fnv1a(key);
+    for (uint32_t s = first; s <= last; s++) {
+        int rc = writing ? g_api.mark_writing(g_region, s, key_hash)
+                         : g_api.mark_ready(g_region, s);
+        if (rc != 0) {
+            g_flip_fail++;
+            return 0xffffffffu;
+        }
+    }
+    g_flip_count++;
+    return first;
+}
+
+// 传输完成后发布 slot（batch 异步路径的第二段; 仍是单 slot——batch 路径
+// 只对 1-block 对象生效, k-block 对象走同步 flip(false)）
+inline void ready_slot(uint32_t slot) {
+    if (slot == 0xffffffffu || !g_region)
+        return;
+    if (g_api.mark_ready(g_region, slot) == 0)
+        g_flip_count++;
+    else
+        g_flip_fail++;
+}
+
+// R4: PutRevoke 联动——撤销路径把对象覆盖的 slot 置 INVALID（可被后续
+// mark_writing 复用），WRITING 残留不再等 daemon 重启回收。
+inline void revoke(const mooncake::Replica::Descriptor &replica) {
+    if (!enabled() || !replica.is_memory_replica())
+        return;
+    const auto &handle = replica.get_memory_descriptor().buffer_descriptor;
+    if (!lazy_init(endpoint_host(handle.transport_endpoint_)))
+        return;
+    if (owner_restarted())
+        return;
+    uint32_t first, last;
+    if (!slot_range(handle, &first, &last))
+        return;
+    for (uint32_t s = first; s <= last; s++)
+        g_api.slot_invalidate(g_region, s);
+}
+
+// P2a 直读: 绕过 TE, 从本进程的 region 映射直接 memcpy 到调用方缓冲。
+// 安全规则: 读区间覆盖的所有 slot 必须 READY（flip 已发布）,
+//           否则回退 TE 路径（保守 — 未翻转的对象无法验证完整性）。
+// 返回 true = 已完成读取; false = 未处理, 调用方走 TE。
+inline bool direct_read(const mooncake::Replica::Descriptor &replica,
+                        const std::vector<mooncake::Slice> &slices,
+                        uint64_t src_offset) {
+    if (!direct_enabled() || !replica.is_memory_replica())
+        return false;
+    const auto &handle0 = replica.get_memory_descriptor().buffer_descriptor;
+    if (!lazy_init(endpoint_host(handle0.transport_endpoint_)))
+        return false;
+    if (owner_restarted())
+        return false;   // 身代切换当拍放弃，下一拍用新 owner_base
+    metrics_tick();
+
+    const auto &handle = replica.get_memory_descriptor().buffer_descriptor;
+    uint64_t off =
+        (uint64_t)handle.buffer_address_ + src_offset - g_owner_base;
+    uint64_t total = 0;
+    for (const auto &s : slices)
+        total += s.size;
+    /* 对齐前置: off 必须落 block 边界（slot 语义的权威前提）。
+     * 非对齐（512 对齐的旧分配或 range read 半 slot 起点）→ 回退 TE。 */
+    if (total == 0 || off >= g_data_bytes || off % g_block != 0 ||
+        off + total > g_data_bytes) {
+        g_direct_fallback++;
+        return false;
+    }
+
+    /* 覆盖 slot 全部 READY 才直读（跨 block 的对象同样安全） */
+    uint32_t first = (uint32_t)(off / g_block);
+    uint32_t last = (uint32_t)((off + total - 1) / g_block);
+    kvc_slot_info_t info;
+    for (uint32_t s = first; s <= last; s++) {
+        if (g_api.slot_query(g_region, s, &info) != 0 ||
+            info.state != KVC_SLOT_READY) {
+            g_direct_fallback++;
+            return false;
+        }
+    }
+    const uint64_t seq_before = info.write_seq;   // 末 slot 的序号快照
+
+    const char *src = g_data_base_local + off;
+    uint64_t done = 0;
+    for (const auto &s : slices) {
+        /* nc 远端内存: 8 深独立 load 流水拷贝（glibc memcpy 单线程仅 63MB/s） */
+        const uint64_t *sp = (const uint64_t *)(src + done);
+        uint64_t *dp = (uint64_t *)s.ptr;
+        size_t n = s.size;
+        while (n >= 64) {
+            uint64_t a0 = sp[0], a1 = sp[1], a2 = sp[2], a3 = sp[3];
+            uint64_t a4 = sp[4], a5 = sp[5], a6 = sp[6], a7 = sp[7];
+            dp[0] = a0; dp[1] = a1; dp[2] = a2; dp[3] = a3;
+            dp[4] = a4; dp[5] = a5; dp[6] = a6; dp[7] = a7;
+            sp += 8; dp += 8; n -= 64;
+        }
+        while (n >= 8) { *dp++ = *sp++; n -= 8; }
+        if (n) memcpy(dp, sp, n);
+        done += s.size;
+    }
+
+    /* 读后校验（correctness T1-2 防线）:
+     * 1) 重读首/末 16B 哨兵 —— 捕获拷贝期间数据被改写（竞态窗口）
+     * 2) 复查末 slot write_seq —— 捕获读前发布的 slot 被复用
+     * 任一不符 → 判脏, 回退 TE（TE 走 owner 本地视图, 永远权威）。
+     * 成本: 2 次 16B nc 读 + 1 次状态查询（纳秒级）。 */
+    {
+        /* 哨兵防御: 首/尾 slice 至少 16B 才可比（零长/超短 slice 跳过
+         * 对应哨兵，避免 size-16 下溢越界读） */
+        const auto &fs = slices.front();
+        const auto &bs = slices.back();
+        bool head_ok = fs.size >= 16;
+        bool tail_ok = bs.size >= 16;
+        const uint64_t *head = (const uint64_t *)(src);
+        const uint64_t *tail =
+            (const uint64_t *)(src + total - 16);
+        const uint64_t *dh = (const uint64_t *)fs.ptr;
+        const uint64_t *dt =
+            (const uint64_t *)((const char *)bs.ptr + bs.size - 16);
+        bool stable = (!head_ok || (dh[0] == head[0] && dh[1] == head[1])) &&
+                      (!tail_ok || (dt[0] == tail[0] && dt[1] == tail[1]));
+        if (stable &&
+            g_api.slot_query(g_region, last, &info) == 0 &&
+            info.state == KVC_SLOT_READY && info.write_seq == seq_before) {
+            g_direct_count++;
+            return true;
+        }
+        g_guard_rejects++;
+        return false;   // 脏读嫌疑: 回退 TE
+    }
+}
+
+// Remove/驱逐联动 (T1-3): 对象删除后 slot 翻 INVALID, 保持介质状态与
+// master 元数据一致（防止位置缓存/直读命中已删对象）
+inline void invalidate_replica(const mooncake::Replica::Descriptor &replica) {
+    if (!enabled() || !g_region || !replica.is_memory_replica())
+        return;
+    if (owner_restarted())
+        return;
+    const auto &handle = replica.get_memory_descriptor().buffer_descriptor;
+    uint32_t first, last;
+    if (!slot_range(handle, &first, &last))
+        return;
+    for (uint32_t s = first; s <= last; s++)
+        g_api.slot_invalidate(g_region, s);
+}
+// C2: 驱逐推送执行端——按 master 任务里的裸地址失效 slot 区间
+inline void invalidate_addr(uint64_t buffer_address, uint64_t size,
+                             uint64_t key_hash) {
+    /* C2: daemon 进程不设 KVC_FLIP_DEVICE（那是读侧开关）——驱逐推送
+     * 到达时按写侧 KVC_SEGMENT_DEVICE 自行初始化 region 访问 */
+    if (!enabled() && !std::getenv("KVC_SEGMENT_DEVICE"))
+        return;
+    if (!lazy_init() || !g_region)
+        return;
+    if (owner_restarted())
+        return;
+    if (buffer_address < g_owner_base)
+        return;
+    uint64_t off = buffer_address - g_owner_base;
+    if (off >= g_data_bytes || off % g_block != 0 || size == 0 ||
+        size % g_block != 0 || off + size > g_data_bytes)
+        return;
+    uint32_t first = (uint32_t)(off / g_block);
+    uint32_t last = (uint32_t)((off + size - 1) / g_block);
+    /* key_hash 守卫: 迟到的推送若遇 slot 已被新对象复用（hash 不符）,
+     * 跳过——绝不误杀活对象; WRITING/FREE 状态同样跳过 */
+    kvc_slot_info_t info;
+    for (uint32_t s2 = first; s2 <= last; s2++) {
+        if (g_api.slot_query(g_region, s2, &info) != 0)
+            continue;
+        if (info.state != KVC_SLOT_READY || info.key_hash != key_hash)
+            continue;
+        g_api.slot_invalidate(g_region, s2);
+    }
+}
+}  // namespace
+}  // namespace kvcflip
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
@@ -1323,7 +1958,16 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferRead(replica, slices);
+    // KVC P2a 直读（R9: 补挂单 get 主路径; hot_cache 命中时 replica 已改指向
+    // 本地缓存 buffer, 几何校验天然不过, 自动走 TransferRead）
+    bool kvc_direct = kvcflip::direct_read(replica, slices, 0);
+    if (kvc_direct && kvcflip::direct_checksum_enabled() &&
+        !kvcflip::direct_checksum_ok(object_key, slices,
+                                     query_result.object_checksum)) {
+        kvcflip::g_checksum_rejects++;
+        kvc_direct = false;
+    }
+    err = kvc_direct ? ErrorCode::OK : TransferRead(replica, slices);
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
@@ -1389,7 +2033,19 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferReadRange(replica, slices, src_offset);
+    bool kvc_direct = kvcflip::direct_read(replica, slices, src_offset);  // KVC P2a
+    if (kvc_direct && kvcflip::direct_checksum_enabled()) {
+        // R5: 直读命中后内容级校验（快算+首验标记）, 不符回退 TE
+        if (!kvcflip::direct_checksum_ok(object_key, slices,
+                                         query_result.object_checksum)) {
+            kvcflip::g_checksum_rejects++;
+            kvc_direct = false;   // 校验失败: 数据存疑, 交给权威 TE 路径
+        }
+    }
+    if (!kvc_direct)
+        err = TransferReadRange(replica, slices, src_offset);
+    else
+        err = ErrorCode::OK;
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -1461,6 +2117,20 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
             cache_used = RedirectToHotCache(key, replica);
+        }
+
+        // KVC P2a 直读（R9: 补挂 prefer_alloc_in_same_node 分支; 命中则
+        // 不进 TE 分组。hot_cache 重定向后的 replica 几何校验天然不过）
+        bool kvc_direct = kvcflip::direct_read(replica, slices_it->second, 0);
+        if (kvc_direct && kvcflip::direct_checksum_enabled() &&
+            !kvcflip::direct_checksum_ok(
+                key, slices_it->second, query_results[i].object_checksum)) {
+            kvcflip::g_checksum_rejects++;
+            kvc_direct = false;
+        }
+        if (kvc_direct) {
+            results[i] = {};
+            continue;
         }
 
         auto& memory_descriptor = replica.get_memory_descriptor();
@@ -1626,6 +2296,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             if (cache_used) {
                 total_cache_hits++;
             }
+        }
+
+        // KVC P2a: 直读命中则跳过 TE（数据已在共享内存, 校验 READY 后 memcpy）
+        bool kvc_direct = kvcflip::direct_read(replica, slices_it->second, 0);
+        if (kvc_direct && kvcflip::direct_checksum_enabled()) {
+            // R5: 直读命中后内容级校验（快算+首验标记）, 不符回退 TE
+            if (!kvcflip::direct_checksum_ok(key, slices_it->second,
+                                             query_result.object_checksum)) {
+                kvcflip::g_checksum_rejects++;
+                kvc_direct = false;
+            }
+        }
+        if (kvc_direct) {
+            results[i] = {};
+            continue;
         }
 
         // Submit transfer operation asynchronously
@@ -1807,7 +2492,10 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     ReplicaTransferSummary transfer_summary;
     for (const auto& replica : start_result.value()) {
         transfer_summary.RecordAllocatedReplica(replica);
+        kvcflip::flip(replica, key, /*writing=*/true);   // KVC P1: PutStart
     }
+    // R4: 记录传输失败的 memory replica, 撤销时联动 slot 置 INVALID
+    std::vector<mooncake::Replica::Descriptor> kvc_failed_replicas;
 
     // Record Put transfer latency (all replicas)
     auto t0_put = std::chrono::steady_clock::now();
@@ -1836,9 +2524,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
+                if (replica.is_memory_replica())
+                    kvc_failed_replicas.push_back(replica);
                 continue;
             }
             transfer_summary.RecordSuccess(replica_type);
+            kvcflip::flip(replica, key, /*writing=*/false);  // KVC P1: 传输完成
         }
     }
 
@@ -1869,6 +2560,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             LOG(ERROR) << "Failed to revoke put operation";
             return tl::unexpected(revoke_result.error());
         }
+        for (const auto& replica : kvc_failed_replicas)
+            kvcflip::revoke(replica);   // KVC R4: 撤销联动 slot INVALID
     }
 
     if (!finalize_decision.success) {
@@ -2026,10 +2719,15 @@ class PutOperation {
     struct PendingTransferRecord {
         ReplicaType replica_type;
         TransferFuture future;
+        uint32_t kvc_slot = 0xffffffffu;  // KVC P1: mark_writing 占据的 slot
 
         PendingTransferRecord(ReplicaType type,
                               TransferFuture&& transfer_future)
             : replica_type(type), future(std::move(transfer_future)) {}
+        PendingTransferRecord(ReplicaType type,
+                              TransferFuture&& transfer_future, uint32_t slot)
+            : replica_type(type), future(std::move(transfer_future)),
+              kvc_slot(slot) {}
     };
 
     PutOperation(std::string_view k, const std::vector<Slice>& s)
@@ -2384,8 +3082,10 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     continue;
                 }
 
+                uint32_t kvc_slot = kvcflip::flip(replica, op.key,
+                                                   /*writing=*/true);
                 op.pending_transfers.emplace_back(
-                    replica_type, std::move(submit_result.value()));
+                    replica_type, std::move(submit_result.value()), kvc_slot);
             }
         }
 
@@ -2395,6 +3095,9 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 }
 
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
+    /* KVC P2e: 批量 flip —— 成功传输的 slot 先收集, 循环外集中发布,
+     * 摊薄逐对象原子发布的 cacheline 开销 */
+    std::vector<uint32_t> ready_batch;
     for (auto& op : ops) {
         // Skip operations that already failed or completed
         if (op.IsResolved()) {
@@ -2413,6 +3116,8 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
             } else {
                 op.transfer_summary.RecordSuccess(
                     pending_transfer.replica_type);
+                if (pending_transfer.kvc_slot != 0xffffffffu)
+                    ready_batch.push_back(pending_transfer.kvc_slot);
             }
         }
 
@@ -2421,6 +3126,10 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                 << ", nof=" << op.transfer_summary.successful_nof_transfers
                 << "), fail(mem=" << op.transfer_summary.failed_memory_transfers
                 << ", nof=" << op.transfer_summary.failed_nof_transfers << ")";
+    }
+
+    for (uint32_t slot : ready_batch) {   // KVC P2e: 集中发布
+        kvcflip::ready_slot(slot);
     }
 }
 
@@ -2471,7 +3180,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                                     key, index);
                     ++pending_finalize_actions[index];
                     break;
-                default:
+    default:
                     LOG(ERROR) << "Unexpected replica type in batch finalize: "
                                << *replica_type;
                     finalize_rpc_errors[index] = ErrorCode::INVALID_PARAMS;
@@ -2547,6 +3256,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                                     ReplicaType replica_type) {
         if (group.keys.empty()) {
             return;
+        }
+        for (size_t i = 0; i < group.indices.size(); ++i) {
+            // KVC R4: 撤销联动 slot INVALID（按 op 持有的 memory replicas）
+            for (const auto& r : ops[group.indices[i]].replicas)
+                kvcflip::revoke(r);
         }
         auto responses =
             master_client_.BatchPutRevoke(group.keys, replica_type);
@@ -4200,6 +4914,16 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                 } else {
                     result = move_result.error();
                 }
+                break;
+            }
+            case TaskType::KVC_INVALIDATE: {
+                // C2: master 驱逐推送 → 失效 shm slot（daemon 侧执行）
+                KvcInvalidatePayload payload;
+                struct_json::from_json(payload, assignment.payload);
+                for (const auto& e : payload.entries)
+                    kvcflip::invalidate_addr(e.buffer_address, e.size,
+                                             e.key_hash);
+                result = ErrorCode::OK;
                 break;
             }
             default:

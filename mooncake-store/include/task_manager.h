@@ -16,12 +16,16 @@ namespace mooncake {
 enum class TaskType {
     REPLICA_COPY,
     REPLICA_MOVE,
+    KVC_INVALIDATE,   // C2: master 驱逐 → 段 owner daemon 失效 slot
 };
 
 inline std::ostream& operator<<(std::ostream& os, const TaskType& type) {
     switch (type) {
         case TaskType::REPLICA_COPY:
             os << "REPLICA_COPY";
+            break;
+        case TaskType::KVC_INVALIDATE:
+            os << "KVC_INVALIDATE";
             break;
         case TaskType::REPLICA_MOVE:
             os << "REPLICA_MOVE";
@@ -99,6 +103,20 @@ struct ReplicaCopyPayload {
 };
 YLT_REFL(ReplicaCopyPayload, tenant_id, key, source, targets);
 
+struct KvcInvalidateEntry {
+    uint64_t buffer_address = 0;   // 被驱逐对象的数据区 VA（owner 侧）
+    uint64_t size = 0;
+    uint64_t key_hash = 0;         // 与写路径 flip 的 fnv1a(key) 同式——
+                                   // daemon 比对后才失效, 防误杀已复用 slot
+};
+YLT_REFL(KvcInvalidateEntry, buffer_address, size, key_hash);
+
+struct KvcInvalidatePayload {
+    std::string transport_endpoint;   // 段 owner（任务投递目标）
+    std::vector<KvcInvalidateEntry> entries;   // 每驱逐轮聚合为一个任务
+};
+YLT_REFL(KvcInvalidatePayload, transport_endpoint, entries);
+
 struct ReplicaMovePayload {
     std::string tenant_id = "default";
     std::string key;
@@ -120,6 +138,12 @@ template <>
 struct TaskPayloadTraits<TaskType::REPLICA_MOVE> {
     using type = ReplicaMovePayload;
     static constexpr const char* name = "ReplicaMovePayload";
+};
+
+template <>
+struct TaskPayloadTraits<TaskType::KVC_INVALIDATE> {
+    using type = KvcInvalidatePayload;
+    static constexpr const char* name = "KvcInvalidatePayload";
 };
 
 template <typename T>
