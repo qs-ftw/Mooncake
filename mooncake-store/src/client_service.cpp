@@ -52,9 +52,13 @@
 //   TransferWrite 成功 → mark_ready（release 语义发布, peer 可见）
 //
 // 环境变量门控（未设置则完全旁路, 零开销）:
-//   KVC_FLIP_DEVICE   shmdev 路径（写端自行 open 映射同一 region, validate 模式）
-//   KVC_FLIP_BLOCK    block size（可选; 仅作断言, 权威值来自 region header）
-//   KVC_FLIP_BYTES    region 总字节（可选; 仅作断言, 权威值来自 region header）
+//   KVC_FLIP_DEVICES   逗号分隔多个 shmdev 路径——同一对端 host 的多个
+//                      region（多 owner daemon / 多 size class）; 读路径按
+//                      buffer_address_ 落在哪段地址区间自动选 region
+//   KVC_FLIP_DEVICE    单 region 形态（向后兼容; KVC_FLIP_DEVICES 优先）
+//   KVC_FLIP_BLOCK    block size（可选; 仅作断言, 权威值来自 region header;
+//                     仅单 region 形态生效）
+//   KVC_FLIP_BYTES    region 总字节（可选; 同上）
 //   T0-1: 几何/owner 身份自 shm header 自描述读取，与 master 元数据
 //         （transport_endpoint host）交叉核验；不符 → T0-2 永久降级全走 TE
 //
@@ -62,33 +66,22 @@
 // target_offset 同源）, slot_idx = offset / block。仅对单 slice 且
 // offset 对齐 block 的对象生效（P1 约束）。
 // ============================================================================
-#include <dlfcn.h>
-#include "/root/gqs/codespace/UnifiedBus/hpc-redis/kvc-sdk/include/kvc/kvc_server.h"
+#include <kvc/kvc_server.h>
 namespace kvcflip {
 namespace {
-struct Api {
-    kvc_region_t *(*open_local)(const kvc_region_config_t *);
-    void (*close)(kvc_region_t *);
-    int (*mark_writing)(kvc_region_t *, uint32_t, uint64_t);
-    int (*mark_ready)(kvc_region_t *, uint32_t);
-    uint64_t (*owner_base)(const kvc_region_t *);
-    uint64_t (*data_bytes)(const kvc_region_t *);
-    void *(*data_base)(const kvc_region_t *);
-    int (*slot_query)(const kvc_region_t *, uint32_t, void *);
-    int (*slot_invalidate)(kvc_region_t *, uint32_t);
-    int (*probe_identity)(const char *, uint64_t, uint32_t,
-                          kvc_region_meta_t *, uint64_t *, uint32_t *);
-    uint64_t (*identity_hash)(const char *);
-    uint32_t (*owner_epoch)(const kvc_region_t *);
+/* 一个对端 host 的一个 region 视图: 各 region 是独立物理段, owner 发布的
+ * 数据区地址区间互不重叠——地址 → region 的归属是唯一确定的。 */
+struct RegionView {
+    kvc_region_t *region;
+    uint32_t block;
+    uint64_t owner_base;    // owner 发布的数据区绝对基址（header 元数据）
+    uint64_t data_bytes;
+    uint32_t epoch;         // lazy_init/refresh 时的身代快照
+    const char *data_base;  // 本进程映射的数据区基址
 };
-Api g_api;
-kvc_region_t *g_region = nullptr;
+std::vector<RegionView> g_regions;   // 同一对端 host 的全部 region
 bool g_init_failed = false;   // 一次性放弃标志: 失败后不再重试, 全走 TE
 char g_disable_reason[512];   // 永久降级原因（观测/门禁判定用）
-uint32_t g_block = 0;
-uint64_t g_owner_base = 0, g_data_bytes = 0;
-uint32_t g_epoch = 0;         // lazy_init/refresh 时的 owner 身代快照
-const char *g_data_base_local = nullptr;   // 本进程映射的数据区基址
 uint64_t g_flip_count = 0, g_flip_fail = 0, g_direct_count = 0, g_direct_fallback = 0;
 uint64_t g_guard_rejects = 0;   // 读后校验拦截数（观测用）
 uint64_t g_epoch_refresh = 0;   // owner 重启身代刷新计数（观测用）
@@ -126,7 +119,50 @@ inline void metrics_tick() {
 }
 
 
-bool enabled() { return std::getenv("KVC_FLIP_DEVICE") != nullptr; }
+/* 配置的全部设备路径: KVC_FLIP_DEVICES（逗号分隔, 多 region）优先,
+ * 回退 KVC_FLIP_DEVICE 单值（C2 daemon 场景再回退 KVC_SEGMENT_DEVICE）。 */
+std::vector<std::string> device_list() {
+    std::vector<std::string> out;
+    const char *multi = std::getenv("KVC_FLIP_DEVICES");
+    if (multi && *multi) {
+        std::string s(multi);
+        size_t beg = 0;
+        for (;;) {
+            size_t end = s.find(',', beg);
+            std::string tok =
+                s.substr(beg, end == std::string::npos ? std::string::npos
+                                                       : end - beg);
+            size_t b = tok.find_first_not_of(' ');
+            size_t e = tok.find_last_not_of(' ');
+            if (e != std::string::npos)
+                out.push_back(tok.substr(b, e - b + 1));
+            if (end == std::string::npos)
+                break;
+            beg = end + 1;
+        }
+        return out;
+    }
+    const char *dev = std::getenv("KVC_FLIP_DEVICE");
+    if (!dev)   // C2: daemon 进程（驱逐推送执行端）只有 KVC_SEGMENT_DEVICE
+        dev = std::getenv("KVC_SEGMENT_DEVICE");
+    if (dev && *dev)
+        out.push_back(dev);
+    return out;
+}
+
+bool enabled() { return !device_list().empty(); }
+
+/* owner 绝对地址 → 所属 region 视图（含 [addr, addr+len) 完整落在数据区） */
+const RegionView *find_region(uint64_t addr, uint64_t len) {
+    for (const auto &rv : g_regions) {
+        if (addr < rv.owner_base)
+            continue;
+        uint64_t off = addr - rv.owner_base;
+        if (off < rv.data_bytes && off + len <= rv.data_bytes)
+            return &rv;
+    }
+    return nullptr;
+}
 
 bool direct_enabled() {
     return enabled() && std::getenv("KVC_DIRECT_READ") != nullptr;
@@ -284,166 +320,164 @@ inline std::string endpoint_host(const std::string &ep) {
 }
 
 bool lazy_init(const std::string &expected_host = std::string()) {
-    if (g_region)
+    if (!g_regions.empty())
         return true;
     if (g_init_failed)
         return false;   // 已判定不可用（配置错/设备缺失），避免每请求重试
-    void *h = dlopen(std::getenv("KVC_SDK_LIB") ? std::getenv("KVC_SDK_LIB")
-                                                : "libkvc_server.so",
-                     RTLD_NOW);
-    if (!h) {
-        disable((std::string("dlopen failed: ") + dlerror()).c_str());
-        return false;
-    }
-    {
-        auto ver = (uint32_t (*)())dlsym(h, "kvc_api_version");
-        if (!ver || ver() != KVC_ABI_VERSION) {
-            disable(ver ? "SDK ABI version mismatch — redeploy matching SDK"
-                        : "SDK missing kvc_api_version — redeploy matching SDK");
-            return false;
-        }
-    }
-    g_api.open_local = (kvc_region_t * (*)(const kvc_region_config_t *))
-        dlsym(h, "kvc_region_open_local");
-    g_api.mark_writing =
-        (int (*)(kvc_region_t *, uint32_t, uint64_t))dlsym(h,
-                                                           "kvc_slot_mark_writing");
-    g_api.mark_ready =
-        (int (*)(kvc_region_t *, uint32_t))dlsym(h, "kvc_slot_mark_ready");
-    g_api.owner_base =
-        (uint64_t(*)(const kvc_region_t *))dlsym(h, "kvc_region_owner_base");
-    g_api.data_bytes =
-        (uint64_t(*)(const kvc_region_t *))dlsym(h, "kvc_region_data_bytes");
-    g_api.data_base =
-        (void *(*)(const kvc_region_t *))dlsym(h, "kvc_region_data_base");
-    g_api.slot_query =
-        (int (*)(const kvc_region_t *, uint32_t, void *))dlsym(h,
-                                                               "kvc_slot_query");
-    g_api.slot_invalidate =
-        (int (*)(kvc_region_t *, uint32_t))dlsym(h, "kvc_slot_invalidate");
-    g_api.probe_identity =
-        (int (*)(const char *, uint64_t, uint32_t, kvc_region_meta_t *,
-                 uint64_t *, uint32_t *))dlsym(h, "kvc_region_probe_identity");
-    g_api.identity_hash =
-        (uint64_t (*)(const char *))dlsym(h, "kvc_identity_hash");
-    g_api.owner_epoch =
-        (uint32_t (*)(const kvc_region_t *))dlsym(h, "kvc_region_owner_epoch");
-    if (!g_api.open_local || !g_api.mark_writing || !g_api.mark_ready ||
-        !g_api.owner_base || !g_api.data_bytes || !g_api.data_base ||
-        !g_api.slot_query || !g_api.slot_invalidate ||
-        !g_api.probe_identity || !g_api.identity_hash || !g_api.owner_epoch) {
-        disable("dlsym incomplete (SDK ABI mismatch — rebuild/redeploy SDK)");
+    /* ABI 校验: 编译期已直接链接 libkvc_server.so，这里防的是部署侧
+     * 运行时 .so 与构建时头文件版本错配（几何/身份协议跨版本不兼容）。 */
+    if (kvc_api_version() != KVC_ABI_VERSION) {
+        disable("SDK ABI version mismatch — linked libkvc_server.so does not "
+                "match build-time headers, redeploy matching SDK");
         return false;
     }
 
-    const char *dev = std::getenv("KVC_FLIP_DEVICE");
-    if (!dev)   // C2: daemon 进程（驱逐推送执行端）只有 KVC_SEGMENT_DEVICE
-        dev = std::getenv("KVC_SEGMENT_DEVICE");
-
-    /* T0-1 几何自读: header 是权威，env 只作断言（配错即拒绝） */
-    kvc_region_meta_t geo = {};
-    uint64_t host_id = 0;
-    uint32_t epoch = 0;
-    int prc = g_api.probe_identity(dev, 0, KVC_REGION_O_SYNC_FALLBACK, &geo,
-                                   &host_id, &epoch);
-    if (prc == KVC_ENOENT) {
-        disable("device has no KVC region (wrong device or owner never "
-                "initialized)");
-        return false;
-    }
-    if (prc != KVC_OK) {
-        disable("region header corrupt/geometry inconsistent — wrong device?");
-        return false;
-    }
-    if (const char *e = std::getenv("KVC_FLIP_BYTES")) {
-        uint64_t want = strtoull(e, nullptr, 0);
-        if (want != geo.data_bytes + geo.data_off) {
-            char buf[256];
-            snprintf(buf, sizeof(buf),
-                     "KVC_FLIP_BYTES=%llu mismatches region header "
-                     "(header total=%llu) — fix env or unset it",
-                     (unsigned long long)want,
-                     (unsigned long long)(geo.data_bytes + geo.data_off));
-            disable(buf);
-            return false;
-        }
-    }
-    if (const char *e = std::getenv("KVC_FLIP_BLOCK")) {
-        uint32_t want = (uint32_t)strtoul(e, nullptr, 0);
-        if (want != geo.block_size) {
-            char buf[192];
-            snprintf(buf, sizeof(buf),
-                     "KVC_FLIP_BLOCK=%u mismatches region header (block=%u)",
-                     want, geo.block_size);
-            disable(buf);
-            return false;
-        }
-    }
-
-    /* T0-1 身份核验: shm 自描述 vs master 元数据（transport_endpoint host） */
-    if (host_id != 0 && !expected_host.empty()) {
-        if (g_api.identity_hash(expected_host.c_str()) != host_id) {
+    const std::vector<std::string> devs = device_list();
+    const bool single = devs.size() == 1;   // env 断言仅单 region 形态有意义
+    std::vector<RegionView> built;
+    built.reserve(devs.size());
+    for (const auto &dev : devs) {
+        /* T0-1 几何自读: header 是权威，env 只作断言（配错即拒绝） */
+        kvc_region_meta_t geo = {};
+        uint64_t host_id = 0;
+        uint32_t epoch = 0;
+        int prc = kvc_region_probe_identity(dev.c_str(), 0,
+                                            KVC_REGION_O_SYNC_FALLBACK, &geo,
+                                            &host_id, &epoch);
+        if (prc == KVC_ENOENT) {
             char buf[320];
             snprintf(buf, sizeof(buf),
-                     "owner identity mismatch: region claims host-hash 0x%llx, "
-                     "master metadata says '%s' — wrong device mapping?",
-                     (unsigned long long)host_id, expected_host.c_str());
+                     "device has no KVC region (wrong device or owner never "
+                     "initialized): %s",
+                     dev.c_str());
             disable(buf);
             return false;
         }
-    }
+        if (prc != KVC_OK) {
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                     "region header corrupt/geometry inconsistent — wrong "
+                     "device? %s",
+                     dev.c_str());
+            disable(buf);
+            return false;
+        }
+        if (single && std::getenv("KVC_FLIP_BYTES")) {
+            const char *e = std::getenv("KVC_FLIP_BYTES");
+            uint64_t want = strtoull(e, nullptr, 0);
+            if (want != geo.data_bytes + geo.data_off) {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                         "KVC_FLIP_BYTES=%llu mismatches region header "
+                         "(header total=%llu) — fix env or unset it",
+                         (unsigned long long)want,
+                         (unsigned long long)(geo.data_bytes + geo.data_off));
+                disable(buf);
+                return false;
+            }
+        }
+        if (single && std::getenv("KVC_FLIP_BLOCK")) {
+            const char *e = std::getenv("KVC_FLIP_BLOCK");
+            uint32_t want = (uint32_t)strtoul(e, nullptr, 0);
+            if (want != geo.block_size) {
+                char buf[224];
+                snprintf(buf, sizeof(buf),
+                         "KVC_FLIP_BLOCK=%u mismatches region header (block=%u)",
+                         want, geo.block_size);
+                disable(buf);
+                return false;
+            }
+        }
 
-    kvc_region_config_t cfg = {};
-    cfg.region_id = geo.region_id;
-    cfg.provider = KVC_PROVIDER_DEVICE;
-    snprintf(cfg.device_path, sizeof(cfg.device_path), "%s", dev);
-    cfg.block_size = geo.block_size;
-    cfg.bytes = geo.data_bytes + geo.data_off;   // 权威几何，来自 header
-    cfg.flags = KVC_REGION_O_SYNC_FALLBACK;      // validate 模式, 不 CREATE
+        /* T0-1 身份核验: shm 自描述 vs master 元数据（transport_endpoint
+         * host）; 多 region 时每个 region 独立核验（同一对端 host） */
+        if (host_id != 0 && !expected_host.empty()) {
+            if (kvc_identity_hash(expected_host.c_str()) != host_id) {
+                char buf[384];
+                snprintf(buf, sizeof(buf),
+                         "owner identity mismatch: region %s claims host-hash "
+                         "0x%llx, master metadata says '%s' — wrong device "
+                         "mapping?",
+                         dev.c_str(), (unsigned long long)host_id,
+                         expected_host.c_str());
+                disable(buf);
+                return false;
+            }
+        }
 
-    g_region = g_api.open_local(&cfg);
-    if (!g_region) {
-        disable("open region failed after probe (concurrent re-init?)");
-        return false;
+        kvc_region_config_t cfg = {};
+        cfg.region_id = geo.region_id;
+        cfg.provider = KVC_PROVIDER_DEVICE;
+        snprintf(cfg.device_path, sizeof(cfg.device_path), "%s", dev.c_str());
+        cfg.block_size = geo.block_size;
+        cfg.bytes = geo.data_bytes + geo.data_off;   // 权威几何，来自 header
+        cfg.flags = KVC_REGION_O_SYNC_FALLBACK;      // validate 模式, 不 CREATE
+
+        kvc_region_t *r = kvc_region_open_local(&cfg);
+        if (!r) {
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                     "open region failed after probe (concurrent re-init?): %s",
+                     dev.c_str());
+            disable(buf);
+            return false;
+        }
+        RegionView rv;
+        rv.region = r;
+        rv.block = geo.block_size;
+        rv.owner_base = kvc_region_owner_base(r);
+        rv.data_bytes = kvc_region_data_bytes(r);
+        rv.epoch = kvc_region_owner_epoch(r);
+        if (rv.owner_base == 0) {
+            char buf[320];
+            snprintf(buf, sizeof(buf),
+                     "owner base not published (segment owner must be up "
+                     "first): %s",
+                     dev.c_str());
+            disable(buf);
+            return false;
+        }
+        rv.data_base = (const char *)kvc_region_data_base(r);
+        built.push_back(rv);
+        LOG(INFO) << "KVC-FLIP: region mapped for state flips (dev=" << dev
+                  << " region_id=" << geo.region_id
+                  << " block=" << cfg.block_size << " bytes=" << cfg.bytes
+                  << " owner_base=0x" << std::hex << rv.owner_base << std::dec
+                  << " owner_epoch=" << rv.epoch << " identity=0x" << std::hex
+                  << host_id << std::dec << ")";
     }
-    g_owner_base = g_api.owner_base(g_region);
-    g_data_bytes = g_api.data_bytes(g_region);
-    g_epoch = g_api.owner_epoch(g_region);
-    g_block = geo.block_size;
-    if (g_owner_base == 0) {
-        disable("owner base not published (segment owner must be up first)");
-        return false;
-    }
-    g_data_base_local = (const char *)g_api.data_base(g_region);
-    LOG(INFO) << "KVC-FLIP: region mapped for state flips (block="
-              << cfg.block_size << " bytes=" << cfg.bytes << " owner_base=0x"
-              << std::hex << g_owner_base << std::dec
-              << " owner_epoch=" << g_epoch << " identity=0x" << std::hex
-              << host_id << std::dec << ")";
+    g_regions = std::move(built);
     return true;
 }
 
-/* T0-1/R2 epoch 复查（命中路径调用，单 acquire load）:
- * owner 重启（epoch 变化）→ 刷新 owner_base/epoch；刷新失败才降级。
- * 返回 false = 继续正常路径；true = 本次操作放弃（调用方走 TE）。 */
+/* T0-1/R2 epoch 复查（命中路径调用，每 region 一次 acquire load）:
+ * owner 重启（任一 region 的 epoch 变化）→ 刷新该 region 的 owner_base/
+ * epoch；刷新失败才降级。返回 false = 继续正常路径；true = 本次操作放弃
+ * （调用方走 TE）。 */
 inline bool owner_restarted() {
-    if (!g_region)
+    if (g_regions.empty())
         return false;
-    uint32_t e = g_api.owner_epoch(g_region);
-    if (e == g_epoch)
-        return false;
-    uint64_t base = g_api.owner_base(g_region);
-    if (base == 0) {
-        disable("owner restarted and has not republished base");
-        return true;
+    bool any = false;
+    for (auto &rv : g_regions) {
+        uint32_t e = kvc_region_owner_epoch(rv.region);
+        if (e == rv.epoch)
+            continue;
+        uint64_t base = kvc_region_owner_base(rv.region);
+        if (base == 0) {
+            disable("owner restarted and has not republished base");
+            return true;
+        }
+        rv.owner_base = base;   /* 身代切换: 新 owner_base 立即生效 */
+        rv.epoch = e;
+        any = true;
     }
-    g_owner_base = base;   /* 身代切换: 新 owner_base 立即生效 */
-    g_epoch = e;
-    g_epoch_refresh++;
-    {
-        /* R5: owner 重启后数据可能被重写, 首验标记全部作废 */
-        std::lock_guard<std::mutex> lock(g_crc_mutex);
-        g_crc_verified.clear();
+    if (any) {
+        g_epoch_refresh++;
+        {
+            /* R5: owner 重启后数据可能被重写, 首验标记全部作废 */
+            std::lock_guard<std::mutex> lock(g_crc_mutex);
+            g_crc_verified.clear();
+        }
     }
     return false;
 }
@@ -457,61 +491,75 @@ inline uint64_t fnv1a(const std::string &s) {
     return h;
 }
 
+// flip/ready_slot 的跨调用 slot 引用: bare slot 序号在多 region 下有歧义,
+// 必须连同所属 region 一起传递（batch 异步路径经 PendingTransferRecord 持有）。
+struct SlotRef {
+    uint32_t region_idx = 0xffffffffu;
+    uint32_t slot = 0xffffffffu;
+    bool valid() const { return slot != 0xffffffffu; }
+};
+
 // 对象覆盖的 slot 区间（R3: 支持任意 k*block 尺寸, 不再定长-only）。
-// 返回 false = 几何不符（未对齐/越界/非整 block）。
-inline bool slot_range(const mooncake::AllocatedBuffer::Descriptor &handle,
+// 返回 false = 几何不符（不在任何 region 内/未对齐/越界/非整 block）。
+inline bool slot_range(const RegionView *&rv,
+                       const mooncake::AllocatedBuffer::Descriptor &handle,
                        uint32_t *first, uint32_t *last) {
-    uint64_t off = (uint64_t)handle.buffer_address_ - g_owner_base;
-    uint64_t size = handle.size_;
-    if (off >= g_data_bytes || off % g_block != 0 || size == 0 ||
-        size % g_block != 0 || off + size > g_data_bytes)
+    const RegionView *r = find_region((uint64_t)handle.buffer_address_,
+                                      handle.size_);
+    if (!r)
         return false;
-    *first = (uint32_t)(off / g_block);
-    *last = (uint32_t)((off + size - 1) / g_block);
+    uint64_t off = (uint64_t)handle.buffer_address_ - r->owner_base;
+    uint64_t size = handle.size_;
+    if (size == 0 || off % r->block != 0 || size % r->block != 0)
+        return false;
+    rv = r;
+    *first = (uint32_t)(off / r->block);
+    *last = (uint32_t)((off + size - 1) / r->block);
     return true;
 }
 
-// flip(replica, writing): 取 memory replica 的段内 offset 换算 slot 区间并
+// flip(replica, writing): 取 memory replica 的绝对地址定位所属 region 并
 // 逐 slot 翻转状态（R3: k*block 对象翻转 k 个 slot）。
-// 返回首 slot（0xffffffff = 未翻转）。batch 路径把返回的 slot 存进
-// PendingTransferRecord, 传输完成后用 ready_slot() 发布。
-inline uint32_t flip(const mooncake::Replica::Descriptor &replica,
-                     const std::string &key, bool writing) {
+// 返回首 slot 的 {region, slot} 引用（invalid = 未翻转）。batch 路径把它
+// 存进 PendingTransferRecord, 传输完成后用 ready_slot() 发布。
+inline SlotRef flip(const mooncake::Replica::Descriptor &replica,
+                    const std::string &key, bool writing) {
     if (!enabled() || !replica.is_memory_replica())
-        return 0xffffffffu;
+        return {};
     const auto &handle0 = replica.get_memory_descriptor().buffer_descriptor;
     if (!lazy_init(endpoint_host(handle0.transport_endpoint_)))
-        return 0xffffffffu;
+        return {};
     if (owner_restarted())
-        return 0xffffffffu;
+        return {};
     metrics_tick();
     const auto &handle = replica.get_memory_descriptor().buffer_descriptor;
     /* buffer_address_ 是段 owner 进程的绝对 VA（TCP transport 在目标侧直接
      * 解引用）；用 owner 发布的 data_base 换算成段内 offset。 */
+    const RegionView *rv = nullptr;
     uint32_t first, last;
-    if (!slot_range(handle, &first, &last)) {
+    if (!slot_range(rv, handle, &first, &last)) {
         g_flip_fail++;
-        return 0xffffffffu;
+        return {};
     }
     uint64_t key_hash = fnv1a(key);
     for (uint32_t s = first; s <= last; s++) {
-        int rc = writing ? g_api.mark_writing(g_region, s, key_hash)
-                         : g_api.mark_ready(g_region, s);
+        int rc = writing ? kvc_slot_mark_writing(rv->region, s, key_hash)
+                         : kvc_slot_mark_ready(rv->region, s);
         if (rc != 0) {
             g_flip_fail++;
-            return 0xffffffffu;
+            return {};
         }
     }
     g_flip_count++;
-    return first;
+    return {(uint32_t)(rv - g_regions.data()), first};
 }
 
 // 传输完成后发布 slot（batch 异步路径的第二段; 仍是单 slot——batch 路径
 // 只对 1-block 对象生效, k-block 对象走同步 flip(false)）
-inline void ready_slot(uint32_t slot) {
-    if (slot == 0xffffffffu || !g_region)
+inline void ready_slot(SlotRef ref) {
+    if (!ref.valid() || ref.region_idx >= g_regions.size())
         return;
-    if (g_api.mark_ready(g_region, slot) == 0)
+    if (kvc_slot_mark_ready(g_regions[ref.region_idx].region, ref.slot) == 0)
         g_flip_count++;
     else
         g_flip_fail++;
@@ -527,11 +575,12 @@ inline void revoke(const mooncake::Replica::Descriptor &replica) {
         return;
     if (owner_restarted())
         return;
+    const RegionView *rv = nullptr;
     uint32_t first, last;
-    if (!slot_range(handle, &first, &last))
+    if (!slot_range(rv, handle, &first, &last))
         return;
     for (uint32_t s = first; s <= last; s++)
-        g_api.slot_invalidate(g_region, s);
+        kvc_slot_invalidate(rv->region, s);
 }
 
 // P2a 直读: 绕过 TE, 从本进程的 region 映射直接 memcpy 到调用方缓冲。
@@ -551,25 +600,29 @@ inline bool direct_read(const mooncake::Replica::Descriptor &replica,
     metrics_tick();
 
     const auto &handle = replica.get_memory_descriptor().buffer_descriptor;
-    uint64_t off =
-        (uint64_t)handle.buffer_address_ + src_offset - g_owner_base;
+    uint64_t addr = (uint64_t)handle.buffer_address_ + src_offset;
     uint64_t total = 0;
     for (const auto &s : slices)
         total += s.size;
     /* 对齐前置: off 必须落 block 边界（slot 语义的权威前提）。
      * 非对齐（512 对齐的旧分配或 range read 半 slot 起点）→ 回退 TE。 */
-    if (total == 0 || off >= g_data_bytes || off % g_block != 0 ||
-        off + total > g_data_bytes) {
+    const RegionView *rv = find_region(addr, total);
+    if (rv == nullptr || total == 0) {
+        g_direct_fallback++;
+        return false;
+    }
+    uint64_t off = addr - rv->owner_base;
+    if (off % rv->block != 0) {
         g_direct_fallback++;
         return false;
     }
 
     /* 覆盖 slot 全部 READY 才直读（跨 block 的对象同样安全） */
-    uint32_t first = (uint32_t)(off / g_block);
-    uint32_t last = (uint32_t)((off + total - 1) / g_block);
+    uint32_t first = (uint32_t)(off / rv->block);
+    uint32_t last = (uint32_t)((off + total - 1) / rv->block);
     kvc_slot_info_t info;
     for (uint32_t s = first; s <= last; s++) {
-        if (g_api.slot_query(g_region, s, &info) != 0 ||
+        if (kvc_slot_query(rv->region, s, &info) != 0 ||
             info.state != KVC_SLOT_READY) {
             g_direct_fallback++;
             return false;
@@ -577,7 +630,7 @@ inline bool direct_read(const mooncake::Replica::Descriptor &replica,
     }
     const uint64_t seq_before = info.write_seq;   // 末 slot 的序号快照
 
-    const char *src = g_data_base_local + off;
+    const char *src = rv->data_base + off;
     uint64_t done = 0;
     for (const auto &s : slices) {
         /* nc 远端内存: 8 深独立 load 流水拷贝（glibc memcpy 单线程仅 63MB/s） */
@@ -617,7 +670,7 @@ inline bool direct_read(const mooncake::Replica::Descriptor &replica,
         bool stable = (!head_ok || (dh[0] == head[0] && dh[1] == head[1])) &&
                       (!tail_ok || (dt[0] == tail[0] && dt[1] == tail[1]));
         if (stable &&
-            g_api.slot_query(g_region, last, &info) == 0 &&
+            kvc_slot_query(rv->region, last, &info) == 0 &&
             info.state == KVC_SLOT_READY && info.write_seq == seq_before) {
             g_direct_count++;
             return true;
@@ -630,45 +683,46 @@ inline bool direct_read(const mooncake::Replica::Descriptor &replica,
 // Remove/驱逐联动 (T1-3): 对象删除后 slot 翻 INVALID, 保持介质状态与
 // master 元数据一致（防止位置缓存/直读命中已删对象）
 inline void invalidate_replica(const mooncake::Replica::Descriptor &replica) {
-    if (!enabled() || !g_region || !replica.is_memory_replica())
+    if (!enabled() || g_regions.empty() || !replica.is_memory_replica())
         return;
     if (owner_restarted())
         return;
     const auto &handle = replica.get_memory_descriptor().buffer_descriptor;
+    const RegionView *rv = nullptr;
     uint32_t first, last;
-    if (!slot_range(handle, &first, &last))
+    if (!slot_range(rv, handle, &first, &last))
         return;
     for (uint32_t s = first; s <= last; s++)
-        g_api.slot_invalidate(g_region, s);
+        kvc_slot_invalidate(rv->region, s);
 }
 // C2: 驱逐推送执行端——按 master 任务里的裸地址失效 slot 区间
 inline void invalidate_addr(uint64_t buffer_address, uint64_t size,
-                             uint64_t key_hash) {
+                            uint64_t key_hash) {
     /* C2: daemon 进程不设 KVC_FLIP_DEVICE（那是读侧开关）——驱逐推送
      * 到达时按写侧 KVC_SEGMENT_DEVICE 自行初始化 region 访问 */
     if (!enabled() && !std::getenv("KVC_SEGMENT_DEVICE"))
         return;
-    if (!lazy_init() || !g_region)
+    if (!lazy_init() || g_regions.empty())
         return;
     if (owner_restarted())
         return;
-    if (buffer_address < g_owner_base)
+    const RegionView *rv = find_region(buffer_address, size);
+    if (!rv || size == 0 || size % rv->block != 0)
         return;
-    uint64_t off = buffer_address - g_owner_base;
-    if (off >= g_data_bytes || off % g_block != 0 || size == 0 ||
-        size % g_block != 0 || off + size > g_data_bytes)
+    uint64_t off = buffer_address - rv->owner_base;
+    if (off % rv->block != 0)
         return;
-    uint32_t first = (uint32_t)(off / g_block);
-    uint32_t last = (uint32_t)((off + size - 1) / g_block);
+    uint32_t first = (uint32_t)(off / rv->block);
+    uint32_t last = (uint32_t)((off + size - 1) / rv->block);
     /* key_hash 守卫: 迟到的推送若遇 slot 已被新对象复用（hash 不符）,
      * 跳过——绝不误杀活对象; WRITING/FREE 状态同样跳过 */
     kvc_slot_info_t info;
     for (uint32_t s2 = first; s2 <= last; s2++) {
-        if (g_api.slot_query(g_region, s2, &info) != 0)
+        if (kvc_slot_query(rv->region, s2, &info) != 0)
             continue;
         if (info.state != KVC_SLOT_READY || info.key_hash != key_hash)
             continue;
-        g_api.slot_invalidate(g_region, s2);
+        kvc_slot_invalidate(rv->region, s2);
     }
 }
 }  // namespace
@@ -2719,13 +2773,14 @@ class PutOperation {
     struct PendingTransferRecord {
         ReplicaType replica_type;
         TransferFuture future;
-        uint32_t kvc_slot = 0xffffffffu;  // KVC P1: mark_writing 占据的 slot
+        kvcflip::SlotRef kvc_slot;   // KVC P1: mark_writing 占据的 {region, slot}
 
         PendingTransferRecord(ReplicaType type,
-                              TransferFuture&& transfer_future)
+                               TransferFuture&& transfer_future)
             : replica_type(type), future(std::move(transfer_future)) {}
         PendingTransferRecord(ReplicaType type,
-                              TransferFuture&& transfer_future, uint32_t slot)
+                              TransferFuture&& transfer_future,
+                              kvcflip::SlotRef slot)
             : replica_type(type), future(std::move(transfer_future)),
               kvc_slot(slot) {}
     };
@@ -3082,8 +3137,8 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     continue;
                 }
 
-                uint32_t kvc_slot = kvcflip::flip(replica, op.key,
-                                                   /*writing=*/true);
+                kvcflip::SlotRef kvc_slot = kvcflip::flip(replica, op.key,
+                                                          /*writing=*/true);
                 op.pending_transfers.emplace_back(
                     replica_type, std::move(submit_result.value()), kvc_slot);
             }
@@ -3097,7 +3152,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
     /* KVC P2e: 批量 flip —— 成功传输的 slot 先收集, 循环外集中发布,
      * 摊薄逐对象原子发布的 cacheline 开销 */
-    std::vector<uint32_t> ready_batch;
+    std::vector<kvcflip::SlotRef> ready_batch;
     for (auto& op : ops) {
         // Skip operations that already failed or completed
         if (op.IsResolved()) {
@@ -3116,7 +3171,7 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
             } else {
                 op.transfer_summary.RecordSuccess(
                     pending_transfer.replica_type);
-                if (pending_transfer.kvc_slot != 0xffffffffu)
+                if (pending_transfer.kvc_slot.valid())
                     ready_batch.push_back(pending_transfer.kvc_slot);
             }
         }
@@ -3128,8 +3183,8 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                 << ", nof=" << op.transfer_summary.failed_nof_transfers << ")";
     }
 
-    for (uint32_t slot : ready_batch) {   // KVC P2e: 集中发布
-        kvcflip::ready_slot(slot);
+    for (const auto &ref : ready_batch) {   // KVC P2e: 集中发布
+        kvcflip::ready_slot(ref);
     }
 }
 

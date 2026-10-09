@@ -56,6 +56,33 @@ if (NOT STORE_USE_ETCD AND NOT STORE_USE_REDIS AND NOT STORE_USE_K8S_LEASE)
     message(STATUS "Store HA backends are disabled")
 endif()
 
+# KVC SDK (hpc-redis static-UB KV-cache medium): the adapter now includes
+# <kvc/kvc_server.h> and links libkvc_server.so directly at build time
+# (no dlopen/dlsym). Resolve the SDK tree once; override with -DKVC_SDK_ROOT=
+# or the KVC_SDK_ROOT environment variable. Default assumes the Mooncake
+# checkout sits inside the hpc-redis tree (Mooncake/ is a sibling of kvc-sdk/).
+if(NOT DEFINED KVC_SDK_ROOT)
+    if(DEFINED ENV{KVC_SDK_ROOT})
+        set(KVC_SDK_ROOT "$ENV{KVC_SDK_ROOT}")
+    else()
+        set(KVC_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../kvc-sdk")
+    endif()
+endif()
+get_filename_component(KVC_SDK_ROOT "${KVC_SDK_ROOT}" ABSOLUTE)
+if(NOT EXISTS "${KVC_SDK_ROOT}/include/kvc/kvc_server.h")
+    message(FATAL_ERROR
+            "KVC SDK headers not found under KVC_SDK_ROOT=${KVC_SDK_ROOT}. "
+            "The KVC adapter compiles against them directly; point "
+            "KVC_SDK_ROOT at the hpc-redis kvc-sdk tree "
+            "(default: <checkout>/../../hpc-redis/kvc-sdk).")
+endif()
+if(NOT EXISTS "${KVC_SDK_ROOT}/build/libkvc_server.so")
+    message(FATAL_ERROR
+            "libkvc_server.so not found under KVC_SDK_ROOT=${KVC_SDK_ROOT}/"
+            "build — run 'make all' inside the kvc-sdk tree first.")
+endif()
+message(STATUS "KVC SDK (static-UB medium, direct link): ${KVC_SDK_ROOT}")
+
 # Add include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/include
@@ -65,6 +92,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/
     ${CMAKE_CURRENT_BINARY_DIR}/include/
     ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/include
+    ${KVC_SDK_ROOT}/include
     ${ETCD_WRAPPER_INCLUDE}
 )
 

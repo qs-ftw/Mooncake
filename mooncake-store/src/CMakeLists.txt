@@ -291,6 +291,13 @@ if(USE_NOF)
                                                     ${DPDK_INCLUDE_DIR})
 endif()
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
+# KVC adapter (client_service/real_client) calls the SDK directly; link the
+# shared object and keep a build-tree rpath so it resolves without
+# LD_LIBRARY_PATH. PRIVATE: kvc types never appear in public headers.
+target_link_libraries(mooncake_store PRIVATE ${KVC_SDK_ROOT}/build/libkvc_server.so)
+set_target_properties(mooncake_store PROPERTIES
+                      BUILD_RPATH "${KVC_SDK_ROOT}/build"
+                      INSTALL_RPATH "$ORIGIN")
 if(STORE_USE_REDIS)
   target_include_directories(mooncake_store
                              PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
