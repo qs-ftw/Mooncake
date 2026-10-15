@@ -95,6 +95,8 @@ option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
+option(USE_UBMEM
+       "option for using UB shared memory device (obmm shmdev) transport" OFF)
 option(USE_SUNRISE
        "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
 option(USE_TPU
@@ -106,6 +108,11 @@ if(USE_UB)
   add_compile_definitions(USE_UB)
   message(STATUS "ub transport is enabled")
   include(${CMAKE_CURRENT_LIST_DIR}/FindUrma.cmake)
+endif()
+
+if(USE_UBMEM)
+  add_compile_definitions(USE_UBMEM)
+  message(STATUS "ubmem transport is enabled")
 endif()
 
 if(USE_EFA)

@@ -254,6 +254,17 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
+#if defined(USE_UBMEM)
+    if (std::getenv("MC_UBMEM_DEV_PATH") != nullptr) {
+        Transport* ubmem_transport =
+            multi_transports_->installTransport("ubmem", local_topology_);
+        if (!ubmem_transport) {
+            LOG(ERROR) << "Failed to install Ubmem transport";
+            return -1;
+        }
+    }
+#endif
+
     if (auto_discover_config_.enabled) {
         LOG(INFO) << "Auto-discovering topology...";
         if (getenv("MC_CUSTOM_TOPO_JSON")) {

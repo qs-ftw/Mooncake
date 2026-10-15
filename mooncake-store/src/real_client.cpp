@@ -1505,9 +1505,36 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifdef USE_NOF
     use_spdk_dma_for_client_buffer = true;
 #endif
-    client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage,
-        use_spdk_dma_for_client_buffer);
+    if (protocol == "ubmem" && local_buffer_size > 0) {
+        /* UB 池窗分区约定：owner 段占窗底 [0, global_segment_size)，
+         * 本地缓冲固定占窗顶（单 driver 纪律——多 driver 进程并存时需按
+         * 进程错峰分区）；owner 侧用 local_buffer_size=0 完全避开。 */
+        const char *env_size = std::getenv("MC_UBMEM_DEV_SIZE");
+        if (!env_size || !*env_size) {
+            LOG(FATAL) << "MC_UBMEM_DEV_SIZE not set (ubmem store mode)";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        uint64_t window = strtoull(env_size, nullptr, 10);
+        void *ubmem_base = client_->GetBaseAddr();
+        if (!ubmem_base || local_buffer_size > window ||
+            (global_segment_size > 0 &&
+             local_buffer_size + global_segment_size > window)) {
+            LOG(FATAL) << "ubmem window partition invalid: window=" << window
+                       << " seg=" << global_segment_size
+                       << " buf=" << local_buffer_size;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        char *buf_base = (char *)ubmem_base + (window - local_buffer_size);
+        LOG(INFO) << "ubmem local buffer at window top: " << (void *)buf_base
+                  << " (" << local_buffer_size << " of " << window
+                  << " bytes)";
+        client_buffer_allocator_ = ClientBufferAllocator::create(
+            buf_base, local_buffer_size, protocol);
+    } else {
+        client_buffer_allocator_ = ClientBufferAllocator::create(
+            local_buffer_size, this->protocol, should_use_hugepage,
+            use_spdk_dma_for_client_buffer);
+    }
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -1555,6 +1582,31 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
+        }
+
+    } else if (protocol == "ubmem") {
+        /* 段固定占窗底 [base, base+global_segment_size)；driver 侧
+         * global_segment_size=0 时跳过挂段（纯读者，只带窗顶缓冲）。 */
+        if (global_segment_size > 0) {
+            const char *env_size = std::getenv("MC_UBMEM_DEV_SIZE");
+            uint64_t window =
+                (env_size && *env_size) ? strtoull(env_size, nullptr, 10)
+                                        : 0;
+            void *ptr = client_->GetBaseAddr();
+            if (!ptr || window == 0 || global_segment_size > window) {
+                LOG(ERROR) << "ubmem segment partition invalid (window="
+                           << window << " seg=" << global_segment_size << ")";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            LOG(INFO) << "Mounting ubmem segment: " << global_segment_size
+                      << " bytes, " << ptr;
+            auto mount_result =
+                client_->MountSegment(ptr, global_segment_size, protocol);
+            if (!mount_result.has_value()) {
+                LOG(ERROR) << "Failed to mount segment: "
+                           << toString(mount_result.error());
+                return tl::unexpected(mount_result.error());
+            }
         }
 
     } else {

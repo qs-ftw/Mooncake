@@ -1795,6 +1795,23 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "ubmem") {
+            /* UB 池窗由 MC_UBMEM_DEV_PATH/_DEV_SIZE 提供（cxl 同款
+             * "transport 拥有段"模型：install 映射整窗并发布
+             * protocol="ubmem" 段，store 侧按窗分区挂段/缓冲）。 */
+            try {
+                transport =
+                    transfer_engine_->installTransport("ubmem", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "ubmem_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install ubmem transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else if (protocol == "cxi") {
             try {
                 transport = transfer_engine_->installTransport("cxi", nullptr);
@@ -2712,7 +2729,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
 
@@ -2840,7 +2857,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
 
@@ -2927,7 +2944,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
     if (client_cfg.prefer_alloc_in_same_node) {
@@ -3846,7 +3863,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
@@ -3896,7 +3913,7 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
     }
 
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
 

@@ -543,6 +543,19 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "ubmem") {
+        segmentJSON["ubmem_name"] = desc.ubmem_name;
+        segmentJSON["ubmem_base_addr"] =
+            static_cast<Json::UInt64>(desc.ubmem_base_addr);
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["offset"] = static_cast<Json::UInt64>(buffer.offset);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
@@ -1001,6 +1014,21 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
+    } else if (desc->protocol == "ubmem") {
+        desc->ubmem_name = segmentJSON["ubmem_name"].asString();
+        desc->ubmem_base_addr = segmentJSON["ubmem_base_addr"].asUInt64();
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.offset = bufferJSON["offset"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            if (buffer.name.empty() || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;
@@ -1338,6 +1366,11 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
 #ifdef USE_CXL
                 ||
                 (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
+#endif
+#ifdef USE_UBMEM
+                ||
+                (iter->offset + segment_desc->ubmem_base_addr) ==
+                    (uint64_t)addr
 #endif
             ) {
                 segment_desc->buffers.erase(iter);

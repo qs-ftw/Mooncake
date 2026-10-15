@@ -38,6 +38,11 @@ if(USE_CXL)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
 endif()
 
+if(USE_UBMEM)
+  add_subdirectory(ubmem_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ubmem_transport>)
+endif()
+
 if(USE_ASCEND_DIRECT)
   add_subdirectory(ascend_transport)
 elseif(USE_ASCEND)

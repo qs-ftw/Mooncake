@@ -93,6 +93,19 @@ if(USE_CXL)
   add_test(NAME cxl_transport_test COMMAND cxl_transport_test)
 endif()
 
+if(USE_UBMEM)
+  add_executable(ubmem_transport_test ${WORKSPACE}/ubmem_transport_test.cpp)
+  target_link_libraries(ubmem_transport_test PUBLIC transfer_engine gtest
+                                                   gtest_main gflags)
+  # 手动跑（需要真实 shmdev 窗口 + 元数据服务），不注册 ctest
+endif()
+
+if(USE_UB OR USE_UBMEM OR USE_CXL)
+  add_executable(ub_ubmem_bench ${WORKSPACE}/ub_ubmem_bench.cpp)
+  target_link_libraries(ub_ubmem_bench PUBLIC transfer_engine glog gflags)
+  # 手动跑（跨节点 URMA/shmdev 对拍基准），不注册 ctest
+endif()
+
 if(USE_NVMEOF)
   add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
   target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest

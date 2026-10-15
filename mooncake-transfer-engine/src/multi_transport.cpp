@@ -61,6 +61,9 @@
 #ifdef USE_UBSHMEM
 #include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
 #endif
+#ifdef USE_UBMEM
+#include "transport/ubmem_transport/ubmem_transport.h"
+#endif
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
 #endif
@@ -427,6 +430,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new UBShmemTransport();
     }
 #endif
+#ifdef USE_UBMEM
+    else if (std::string(proto) == "ubmem") {
+        transport = new UbmemTransport();
+    }
+#endif
 #ifdef USE_EFA
     else if (std::string(proto) == "efa") {
         transport = new EfaTransport();
@@ -668,6 +676,13 @@ void* MultiTransport::getBaseAddr() {
     if (transport) {
         auto* cxl_transport = dynamic_cast<CxlTransport*>(transport);
         return cxl_transport ? cxl_transport->getCxlBaseAddr() : 0;
+    }
+#endif
+#ifdef USE_UBMEM
+    Transport* ubmem_transport = getTransport("ubmem");
+    if (ubmem_transport) {
+        auto* ubmem = dynamic_cast<UbmemTransport*>(ubmem_transport);
+        return ubmem ? ubmem->getUbmemBaseAddr() : 0;
     }
 #endif
     return 0;
