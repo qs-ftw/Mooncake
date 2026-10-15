@@ -8,6 +8,9 @@
 #include "segment.h"
 
 #include <csignal>
+#include <atomic>
+#include <fstream>
+#include <iterator>
 #include "crc_checksum.h"
 #include <algorithm>
 #include <array>
@@ -78,6 +81,7 @@ struct RegionView {
     uint64_t data_bytes;
     uint32_t epoch;         // lazy_init/refresh 时的身代快照
     const char *data_base;  // 本进程映射的数据区基址
+    bool borrowed = false;  // UBME: 复用本进程 owner region（不参与重建关闭）
 };
 std::vector<RegionView> g_regions;   // 同一对端 host 的全部 region
 bool g_init_failed = false;   // 一次性放弃标志: 失败后不再重试, 全走 TE
@@ -150,7 +154,89 @@ std::vector<std::string> device_list() {
     return out;
 }
 
-bool enabled() { return !device_list().empty(); }
+/* ---- UBME 动态段来源（kvc-sdk ABI v3）----
+ * KVC_UBME_OWNER_HOSTS="host[,host...]": 未配置任何路径 env 时，按 owner
+ * host 推导段名（kvc_seg_name）attach（同机 journal 复用优先，跨节点经
+ * mesh PULL import），得到本地设备路径——下游 probe/open 流程不变。
+ * ctx 参数: KVC_UBME_NODE_ID（默认 1）/ KVC_UBME_TCP_PORT（默认 0=内核
+ * 自动分配，纯出向 reader）/ KVC_UBME_PEERS（"id:ip:port:cna,..."，跨
+ * 节点必配; cna 裸值按十进制=/proc/mami/udm/udevice 口径，0x 前缀按十六
+ * 进制——喂错进制会把 decoder dstCNA 指到不存在的节点）。 */
+std::vector<std::string> g_ubme_seg_names;   // attach 在案段名（owner 重启重建用）
+std::mutex g_ubme_mutex;                     // 解析缓存 + 重建串行化
+
+bool ubme_ctx_ready() {
+    static bool ok = []() {
+        const char *n = std::getenv("KVC_UBME_NODE_ID");
+        const char *p = std::getenv("KVC_UBME_TCP_PORT");
+        return kvc_ubme_init(n ? (uint32_t)strtoul(n, nullptr, 0) : 1u,
+                             p ? (uint16_t)strtoul(p, nullptr, 0) : 0u,
+                             std::getenv("KVC_UBME_PEERS")) == KVC_OK;
+    }();
+    return ok;
+}
+
+std::vector<std::string> ubme_attach_hosts() {
+    std::vector<std::string> out;
+    const char *multi = std::getenv("KVC_UBME_OWNER_HOSTS");
+    if (!multi || !*multi)
+        return out;
+    if (!ubme_ctx_ready()) {
+        LOG(ERROR) << "KVC-FLIP: ubme ctx init failed (runtime present? "
+                      "KVC_UBME_PEERS well-formed?)";
+        return out;
+    }
+    std::string s(multi);
+    size_t beg = 0;
+    for (;;) {
+        size_t end = s.find(',', beg);
+        std::string host = s.substr(
+            beg, end == std::string::npos ? std::string::npos : end - beg);
+        size_t b = host.find_first_not_of(' ');
+        size_t e = host.find_last_not_of(' ');
+        if (e != std::string::npos) {
+            host = host.substr(b, e - b + 1);
+            char seg[64];
+            kvc_seg_name(seg, host.c_str());
+            char path[96];
+            if (kvc_region_attach_ubme(seg, 30000, path, sizeof(path)) !=
+                KVC_OK) {
+                LOG(ERROR) << "KVC-FLIP: ubme attach failed (seg=" << seg
+                           << " — owner up? peers configured?)";
+                return {};
+            }
+            LOG(INFO) << "KVC-FLIP: ubme segment attached (seg=" << seg
+                      << " -> " << path << ")";
+            g_ubme_seg_names.push_back(seg);
+            out.push_back(path);
+        }
+        if (end == std::string::npos)
+            break;
+        beg = end + 1;
+    }
+    return out;
+}
+
+/* 路径 env 优先；缺省走 UBME 按名解析。结果缓存（attach 含 mesh/IO 开销，
+ * 且 enabled() 每请求查询）; owner 重启重建时经 invalidate 刷新。
+ * 热路径只读 atomic（解析完成后 vector 不再被写，重建走 slow path）。 */
+std::vector<std::string> g_devices_cache;
+std::atomic<bool> g_devices_resolved{false};
+
+const std::vector<std::string> &effective_devices() {
+    if (!g_devices_resolved.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_ubme_mutex);
+        if (!g_devices_resolved.load(std::memory_order_relaxed)) {
+            g_devices_cache = device_list();
+            if (g_devices_cache.empty())
+                g_devices_cache = ubme_attach_hosts();
+            g_devices_resolved.store(true, std::memory_order_release);
+        }
+    }
+    return g_devices_cache;
+}
+
+bool enabled() { return !effective_devices().empty(); }
 
 /* owner 绝对地址 → 所属 region 视图（含 [addr, addr+len) 完整落在数据区） */
 const RegionView *find_region(uint64_t addr, uint64_t len) {
@@ -332,7 +418,45 @@ bool lazy_init(const std::string &expected_host = std::string()) {
         return false;
     }
 
-    const std::vector<std::string> devs = device_list();
+    const std::vector<std::string> devs = effective_devices();
+
+    /* 多线程首次直读会并发进入 init（如 native driver 的 reader 线程），
+     * 并发 build 后各自 move-assign g_regions 是数据竞争——用 g_ubme_mutex
+     * 串行化，锁内双重检查避免重复建。锁必须在 effective_devices() 之后：
+     * 它内部也拿 g_ubme_mutex。 */
+    std::lock_guard<std::mutex> init_lock(g_ubme_mutex);
+    if (!g_regions.empty())
+        return true;
+    if (g_init_failed)
+        return false;
+
+    /* UBME owner 进程（daemon, KVC_SEGMENT_UBME=1）无路径 env: C2 驱逐推送
+     * 直接复用本进程 owner region（real_client map_segment 所建），免二次
+     * 映射。borrowed 视图不参与 owner 重启重建（owner 不会死在自己之下）。 */
+    if (devs.empty() && std::getenv("KVC_SEGMENT_UBME")) {
+        kvc_region_t *own = kvc_owner_region();
+        if (own) {
+            kvc_region_meta_t m = {};
+            kvc_region_meta(own, &m);
+            RegionView rv;
+            rv.region = own;
+            rv.block = m.block_size;
+            rv.owner_base = kvc_region_owner_base(own);
+            rv.data_bytes = kvc_region_data_bytes(own);
+            rv.epoch = kvc_region_owner_epoch(own);
+            rv.data_base = (const char *)kvc_region_data_base(own);
+            rv.borrowed = true;
+            g_regions.push_back(rv);
+            LOG(INFO) << "KVC-FLIP: using in-process owner region (C2 flips, "
+                         "region_id="
+                      << m.region_id << " data_bytes=" << rv.data_bytes << ")";
+            return true;
+        }
+        return false;   // owner region 未建（segment 未启用/已失败）→ flips 关
+    }
+    if (devs.empty()) {
+        return false;
+    }
     const bool single = devs.size() == 1;   // env 断言仅单 region 形态有意义
     std::vector<RegionView> built;
     built.reserve(devs.size());
@@ -454,9 +578,49 @@ bool lazy_init(const std::string &expected_host = std::string()) {
  * owner 重启（任一 region 的 epoch 变化）→ 刷新该 region 的 owner_base/
  * epoch；刷新失败才降级。返回 false = 继续正常路径；true = 本次操作放弃
  * （调用方走 TE）。 */
+/* UBME reader 侧 owner 重启恢复: 关旧映射 → detach 旧 import（对端新段
+ * 已是新 mem_id，journal 复用会命中死节点，必须先解除）→ 重 attach →
+ * 重开 → 换视图。失败则永久降级 TE（与既有 disable 语义一致）。 */
+void ubme_rebuild_views() {
+    std::lock_guard<std::mutex> lock(g_ubme_mutex);
+    g_devices_resolved.store(false, std::memory_order_release);
+    for (auto &rv : g_regions)
+        if (!rv.borrowed)
+            kvc_region_close(rv.region);
+    g_regions.clear();
+    for (const auto &seg : g_ubme_seg_names)
+        kvc_region_detach_ubme(seg.c_str());
+    g_ubme_seg_names.clear();
+    if (!effective_devices().empty()) {
+        g_init_failed = false;
+        if (lazy_init()) {
+            g_epoch_refresh++;
+            return;
+        }
+    }
+    disable("ubme re-attach after owner restart failed");
+}
+
 inline bool owner_restarted() {
     if (g_regions.empty())
         return false;
+    /* UBME 动态段: owner 重启后是"新段新 epoch"，被 watch 的旧段 epoch
+     * 永远不变——必须叠加 mesh 陈旧探测（对端离线/重上线闩锁）触发重建;
+     * 无 mesh（纯同机复用）时探测恒 0，陈旧窗口由 poscache TTL + master
+     * 元数据（新 buffer_address_ 不落旧视图 → TE 回退）兜底。重建窗口内
+     * 并发直读可能踩到刚 munmap 的旧映射（与既有 epoch 无锁刷新同级风险
+     * 面，owner 重启为罕见事件; 本拍作 miss 走 TE）。 */
+    if (!g_ubme_seg_names.empty()) {
+        for (const auto &rv : g_regions) {
+            if ((!rv.borrowed &&
+                 kvc_region_owner_epoch(rv.region) != rv.epoch) ||
+                kvc_ubme_imports_stale() == 1) {
+                ubme_rebuild_views();
+                return true;
+            }
+        }
+        return false;
+    }
     bool any = false;
     for (auto &rv : g_regions) {
         uint32_t e = kvc_region_owner_epoch(rv.region);
@@ -1561,6 +1725,37 @@ ErrorCode Client::InitTransferEngine(
 
             if (!transport) {
                 LOG(ERROR) << "Failed to install TCP transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+        } else if (protocol == "ub") {
+            /* URMA 设备名不在 RDMA 注册表里，Topology::discover 认不出
+             * （HCA 列表空 → UbTransport 回退 mock_urma_device 后崩）；
+             * 用 MC_CUSTOM_TOPO_JSON 矩阵直接注入（格式同 transfer-engine
+             * ub bench: {"cpu:0": [["udma1"], []], ...}）。 */
+            auto topology = transfer_engine_->getLocalTopology();
+            const char* topo_path = std::getenv("MC_CUSTOM_TOPO_JSON");
+            bool topo_ok = false;
+            if (topology && topo_path && *topo_path) {
+                std::ifstream in(topo_path);
+                std::string json((std::istreambuf_iterator<char>(in)),
+                                 std::istreambuf_iterator<char>());
+                if (!json.empty() && topology->parse(json) == 0 &&
+                    !topology->getHcaList().empty()) {
+                    topo_ok = true;
+                    LOG(INFO) << "UB topology injected from " << topo_path
+                              << " (" << topology->getHcaList().size()
+                              << " HCAs)";
+                }
+            }
+            if (!topo_ok) {
+                LOG(ERROR) << "ub protocol requires MC_CUSTOM_TOPO_JSON "
+                              "pointing to a valid topology matrix (URMA "
+                              "devices are invisible to auto discovery)";
+                return ErrorCode::INVALID_PARAMS;
+            }
+            transport = transfer_engine_->installTransport("ub", nullptr);
+            if (!transport) {
+                LOG(ERROR) << "Failed to install UB transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "ascend" || protocol == "ubshmem" ||

@@ -713,6 +713,83 @@ std::vector<std::string> device_list() {
     return out;
 }
 
+/* ---- UBME 动态段来源（kvc-sdk ABI v3）----
+ * KVC_UBME_OWNER_HOSTS="host[,host...]": 未配置路径 env 时按 owner host
+ * 推导段名 attach（同机 journal 复用优先，跨节点 mesh PULL），得到本地
+ * 设备路径——下游 probe/open 不变。ctx env 与 kvcflip 同名同义
+ * （KVC_UBME_NODE_ID/KVC_UBME_TCP_PORT/KVC_UBME_PEERS，见 kvcflip 注）。 */
+std::vector<std::string> g_ubme_seg_names;   // attach 在案段名（owner 重启重建用）
+std::mutex g_ubme_mutex;
+
+bool ubme_ctx_ready() {
+    static bool ok = []() {
+        const char *n = std::getenv("KVC_UBME_NODE_ID");
+        const char *p = std::getenv("KVC_UBME_TCP_PORT");
+        return kvc_ubme_init(n ? (uint32_t)strtoul(n, nullptr, 0) : 1u,
+                             p ? (uint16_t)strtoul(p, nullptr, 0) : 0u,
+                             std::getenv("KVC_UBME_PEERS")) == KVC_OK;
+    }();
+    return ok;
+}
+
+std::vector<std::string> ubme_attach_hosts() {
+    std::vector<std::string> out;
+    const char *multi = std::getenv("KVC_UBME_OWNER_HOSTS");
+    if (!multi || !*multi)
+        return out;
+    if (!ubme_ctx_ready()) {
+        LOG(ERROR) << "KVC-POSCACHE: ubme ctx init failed (runtime present? "
+                      "KVC_UBME_PEERS well-formed?)";
+        return out;
+    }
+    std::string s(multi);
+    size_t beg = 0;
+    for (;;) {
+        size_t end = s.find(',', beg);
+        std::string host = s.substr(
+            beg, end == std::string::npos ? std::string::npos : end - beg);
+        size_t b = host.find_first_not_of(' ');
+        size_t e = host.find_last_not_of(' ');
+        if (e != std::string::npos) {
+            host = host.substr(b, e - b + 1);
+            char seg[64];
+            kvc_seg_name(seg, host.c_str());
+            char path[96];
+            if (kvc_region_attach_ubme(seg, 30000, path, sizeof(path)) !=
+                KVC_OK) {
+                LOG(ERROR) << "KVC-POSCACHE: ubme attach failed (seg=" << seg
+                           << " — owner up? peers configured?)";
+                return {};
+            }
+            LOG(INFO) << "KVC-POSCACHE: ubme segment attached (seg=" << seg
+                      << " -> " << path << ")";
+            g_ubme_seg_names.push_back(seg);
+            out.push_back(path);
+        }
+        if (end == std::string::npos)
+            break;
+        beg = end + 1;
+    }
+    return out;
+}
+
+/* 路径 env 优先；缺省 UBME 按名解析; atomic 快路径（热路径免锁）。 */
+std::vector<std::string> g_devices_cache;
+std::atomic<bool> g_devices_resolved{false};
+
+const std::vector<std::string> &effective_devices() {
+    if (!g_devices_resolved.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_ubme_mutex);
+        if (!g_devices_resolved.load(std::memory_order_relaxed)) {
+            g_devices_cache = device_list();
+            if (g_devices_cache.empty())
+                g_devices_cache = ubme_attach_hosts();
+            g_devices_resolved.store(true, std::memory_order_release);
+        }
+    }
+    return g_devices_cache;
+}
+
 /* owner 绝对地址 → 所属 region 视图（[addr, addr+len) 完整落在数据区） */
 const RegionView *find_region(uint64_t addr, uint64_t len) {
     for (const auto &rv : g_regions) {
@@ -768,10 +845,10 @@ bool lazy_init(const std::string &expected_host = std::string()) {
         return false;
     }
 
-    const std::vector<std::string> devs = device_list();
+    const std::vector<std::string> devs = effective_devices();
     if (devs.empty()) {
         disable("KVC_POS_CACHE set but no device configured "
-                "(KVC_FLIP_DEVICES / KVC_FLIP_DEVICE)");
+                "(KVC_FLIP_DEVICES / KVC_FLIP_DEVICE / KVC_UBME_OWNER_HOSTS)");
         return false;
     }
     const bool single = devs.size() == 1;   // env 断言仅单 region 形态有意义
@@ -882,9 +959,44 @@ bool lazy_init(const std::string &expected_host = std::string()) {
 /* T0-1/R2: owner 重启（任一 region epoch 变化）→ 清空全部缓存（旧
  * buffer_address_ 是旧 daemon 的 VA）+ 刷新该 region 的 owner_base。
  * 返回 true = 本次作 miss 处理。 */
+/* UBME reader 侧 owner 重启恢复: 关旧映射 → detach 旧 import → 重 attach
+ * → 重开（重建窗口的并发风险与 kvcflip 同注; 失败永久降级 master RPC）。 */
+void ubme_rebuild_views() {
+    std::lock_guard<std::mutex> lock(g_ubme_mutex);
+    g_devices_resolved.store(false, std::memory_order_release);
+    for (auto &rv : g_regions)
+        kvc_region_close(rv.region);
+    g_regions.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_cache.clear();
+    }
+    for (const auto &seg : g_ubme_seg_names)
+        kvc_region_detach_ubme(seg.c_str());
+    g_ubme_seg_names.clear();
+    if (!effective_devices().empty()) {
+        g_init_failed = false;
+        if (lazy_init()) {
+            g_epoch_flush++;
+            return;
+        }
+    }
+    disable("ubme re-attach after owner restart failed");
+}
+
 bool owner_restarted_flush() {
     if (g_regions.empty())
         return false;
+    if (!g_ubme_seg_names.empty()) {
+        for (const auto &rv : g_regions) {
+            if (kvc_region_owner_epoch(rv.region) != rv.epoch ||
+                kvc_ubme_imports_stale() == 1) {
+                ubme_rebuild_views();
+                return true;   // 身代刚切换，本拍作 miss
+            }
+        }
+        return false;
+    }
     bool any = false;
     for (auto &rv : g_regions) {
         uint32_t e = kvc_region_owner_epoch(rv.region);
@@ -917,20 +1029,27 @@ std::optional<mooncake::QueryResult> try_get(const std::string &key) {
     if (owner_restarted_flush())
         return std::nullopt;   // 身代刚切换，本拍作 miss
     metrics_tick();
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_cache.find(key);
-    if (it == g_cache.end()) {
-        g_misses++;
-        return std::nullopt;
-    }
-    if (std::chrono::steady_clock::now() - it->second.cached_at >
-        std::chrono::milliseconds(ttl_ms())) {
-        g_cache.erase(it);
-        g_misses++;
-        return std::nullopt;
+    /* 锁内只取快照，slot 硬校验（跨节点为 ~µs 级 NC 远端 load）在锁外做：
+     * 校验放进全局锁会把所有 reader 串成一路——跨节点实测钉死在
+     * ~245 MB/s（62k slot 查询/s），本地因 slot 读走缓存内存未暴露。 */
+    Entry snap;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_cache.find(key);
+        if (it == g_cache.end()) {
+            g_misses++;
+            return std::nullopt;
+        }
+        if (std::chrono::steady_clock::now() - it->second.cached_at >
+            std::chrono::milliseconds(ttl_ms())) {
+            g_cache.erase(it);
+            g_misses++;
+            return std::nullopt;
+        }
+        snap = it->second;
     }
     /* slot 硬校验: 用第一个 memory replica 的地址定位所属 region 与 slot */
-    const auto &replicas = it->second.replicas;
+    const auto &replicas = snap.replicas;
     for (const auto &r : replicas) {
         if (!r.is_memory_replica())
             continue;
@@ -950,18 +1069,24 @@ std::optional<mooncake::QueryResult> try_get(const std::string &key) {
         if (kvc_slot_query(rv->region, (uint32_t)(off / rv->block), &info) != 0)
             break;
         if (info.state != KVC_SLOT_READY ||
-            info.key_hash != it->second.key_hash ||
-            info.write_seq != it->second.write_seq) {
-            g_cache.erase(it);
+            info.key_hash != snap.key_hash ||
+            info.write_seq != snap.write_seq) {
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_cache.erase(key);
+            }
             g_invalid++;
             return std::nullopt;
         }
         g_hits++;
         return mooncake::QueryResult(
-            std::vector<Replica::Descriptor>(it->second.replicas),
-            it->second.lease_timeout, it->second.checksum);
+            std::vector<Replica::Descriptor>(snap.replicas),
+            snap.lease_timeout, snap.checksum);
     }
-    g_cache.erase(it);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_cache.erase(key);
+    }
     g_invalid++;
     return std::nullopt;
 }
@@ -1055,6 +1180,10 @@ void invalidate_cached(const std::string &key) {
 //
 // 环境变量门控:
 //   KVC_SEGMENT_DEVICE  shmdev 路径（如 /dev/obmm_shmdev1）；未设置则关闭
+//   KVC_SEGMENT_UBME=1  ubme 动态段: daemon 自 export（段名= kvc_seg_name(
+//                       hostname)，读者按名 attach）; DEVICE 未设时生效。
+//                       ctx: KVC_UBME_NODE_ID/KVC_UBME_TCP_PORT/KVC_UBME_PEERS
+//                       （跨节点需配 peers，cna 十进制=/proc 口径）
 //   KVC_REGION_ID       region id（默认 1）
 //   KVC_BLOCK_SIZE      定长 block（默认 4096，须 512 倍数）
 //
@@ -1101,7 +1230,13 @@ bool abi_check() {
     return ok;
 }
 
-bool segment_enabled() { return std::getenv("KVC_SEGMENT_DEVICE") != nullptr; }
+/* 段来源开关: KVC_SEGMENT_DEVICE（静态预置设备）或 KVC_SEGMENT_UBME=1
+ * （ubme 动态段——daemon 自 export，段名收敛自本进程 hostname，读者按名
+ * attach）。两者都设时静态优先（既有行为不变）。 */
+bool segment_enabled() {
+    return std::getenv("KVC_SEGMENT_DEVICE") != nullptr ||
+           std::getenv("KVC_SEGMENT_UBME") != nullptr;
+}
 
 // setup 时由 RealClient 注入 local_hostname（与 master 元数据里 transport_
 // endpoint 的 host 部分同源），供 owner_identity 使用
@@ -1129,7 +1264,6 @@ void *map_segment(size_t segment_size, size_t &mapped_size) {
         return seg_base;
     }
 
-    const char *dev = std::getenv("KVC_SEGMENT_DEVICE");
     uint32_t block = 4096, rid = 1;
     if (const char *e = std::getenv("KVC_BLOCK_SIZE"))
         block = (uint32_t)strtoul(e, nullptr, 0);
@@ -1145,38 +1279,76 @@ void *map_segment(size_t segment_size, size_t &mapped_size) {
 
     kvc_region_config_t cfg = {};
     cfg.region_id = rid;
-    cfg.provider = KVC_PROVIDER_DEVICE;
-    snprintf(cfg.device_path, sizeof(cfg.device_path), "%s", dev);
-    cfg.bytes = region_bytes;
     cfg.block_size = block;
-    /* 先 validate 复用既有 region（slot 状态/数据跨重启持久）。
-     * validate 失败时必须区分两种情况（防止静默摧毁既有数据）:
-     *   - 未初始化（无 magic）→ CREATE 安全
-     *   - 已初始化但几何/身份冲突 → 拒绝启动（配置错误，人为介入） */
-    cfg.flags = KVC_REGION_O_SYNC_FALLBACK;
-    g_region = kvc_region_open_local(&cfg);
-    if (!g_region) {
-        /* open_local 失败原因未知，用 probe 二次判定:
-           重新 mmap 只读探测 header。实现上借用 CREATE 标志位关闭的
-           open_local 已含 validate——它失败可能是未初始化或冲突。
-           这里通过 KVC_REGION_PROBE 只读路径区分（SDK 侧 probe 接口）。 */
-        if (kvc_region_probe(&cfg) == KVC_PROBE_UNINITIALIZED) {
-            cfg.flags = KVC_REGION_CREATE | KVC_REGION_O_SYNC_FALLBACK;
-            g_region = kvc_region_open_local(&cfg);
-        } else {
-            LOG(ERROR) << "KVC: region geometry conflict on " << cfg.device_path
+    cfg.bytes = region_bytes;
+    const char *dev = std::getenv("KVC_SEGMENT_DEVICE");
+    std::string dev_desc;   // 末尾日志用（静态=设备路径, UBME=段名）
+    if (!dev && std::getenv("KVC_SEGMENT_UBME")) {
+        /* 动态段: 段名收敛自 owner host（读者侧 kvc_seg_name 推导同源）。
+         * 段不跨进程重启——本进程 ctx 的 journal sweep 先回收崩溃残留再
+         * export（R3）; 段名冲突（双 owner）即失败。正常退出经 atexit 优雅
+         * unexport（先 munmap）; SIGTERM 后靠下次启动 sweep。 */
+        char seg[64];
+        kvc_seg_name(seg, owner_identity(nullptr).c_str());
+        cfg.provider = KVC_PROVIDER_UBME;
+        snprintf(cfg.seg_name, sizeof(cfg.seg_name), "%s", seg);
+        const char *n = std::getenv("KVC_UBME_NODE_ID");
+        const char *p = std::getenv("KVC_UBME_TCP_PORT");
+        cfg.ubme_node_id = n ? (uint32_t)strtoul(n, nullptr, 0) : 1u;
+        cfg.ubme_tcp_port = p ? (uint16_t)strtoul(p, nullptr, 0) : 0u;
+        if (const char *peers = std::getenv("KVC_UBME_PEERS"))
+            snprintf(cfg.ubme_peers, sizeof(cfg.ubme_peers), "%s", peers);
+        cfg.flags = KVC_REGION_CREATE;
+        g_region = kvc_region_open_local(&cfg);
+        if (!g_region) {
+            LOG(ERROR) << "KVC: ubme segment create failed (seg=" << seg
+                       << " bytes=" << region_bytes
+                       << ") — double owner or export failure";
+            return nullptr;
+        }
+        static bool atexit_armed = []() {
+            std::atexit(kvc_owner_shutdown);
+            return true;
+        }();
+        (void)atexit_armed;
+        dev_desc = seg;
+        LOG(INFO) << "KVC: ubme segment created (seg=" << seg
+                  << " node=" << cfg.ubme_node_id
+                  << " tcp_port=" << cfg.ubme_tcp_port << ")";
+    } else {
+        cfg.provider = KVC_PROVIDER_DEVICE;
+        snprintf(cfg.device_path, sizeof(cfg.device_path), "%s", dev);
+        /* 先 validate 复用既有 region（slot 状态/数据跨重启持久）。
+         * validate 失败时必须区分两种情况（防止静默摧毁既有数据）:
+         *   - 未初始化（无 magic）→ CREATE 安全
+         *   - 已初始化但几何/身份冲突 → 拒绝启动（配置错误，人为介入） */
+        cfg.flags = KVC_REGION_O_SYNC_FALLBACK;
+        g_region = kvc_region_open_local(&cfg);
+        if (!g_region) {
+            /* open_local 失败原因未知，用 probe 二次判定:
+               重新 mmap 只读探测 header。实现上借用 CREATE 标志位关闭的
+               open_local 已含 validate——它失败可能是未初始化或冲突。
+               这里通过 KVC_REGION_PROBE 只读路径区分（SDK 侧 probe 接口）。 */
+            if (kvc_region_probe(&cfg) == KVC_PROBE_UNINITIALIZED) {
+                cfg.flags = KVC_REGION_CREATE | KVC_REGION_O_SYNC_FALLBACK;
+                g_region = kvc_region_open_local(&cfg);
+            } else {
+                LOG(ERROR) << "KVC: region geometry conflict on "
+                           << cfg.device_path
                        << " (region_id=" << cfg.region_id
                        << " block=" << cfg.block_size
                        << " bytes=" << cfg.bytes
                        << ") — refusing CREATE to protect existing data. "
                           "Fix config or migrate region manually.";
+                return nullptr;
+            }
+        }
+        if (!g_region) {
+            LOG(ERROR) << "KVC: open_local failed (dev=" << dev
+                       << " bytes=" << region_bytes << ")";
             return nullptr;
         }
-    }
-    if (!g_region) {
-        LOG(ERROR) << "KVC: open_local failed (dev=" << dev
-                   << " bytes=" << region_bytes << ")";
-        return nullptr;
+        dev_desc = dev;
     }
     uint64_t data_bytes = kvc_region_data_bytes(g_region);
     /* A2: 启动期残留回收——单写者假设下, daemon 启动时无写入者存活,
@@ -1189,9 +1361,9 @@ void *map_segment(size_t segment_size, size_t &mapped_size) {
                   << kvc_region_id(g_region);
     kvc_region_publish_base(g_region);   // 供写端进程做 buffer_address_ offset 换算
     /* T0-1: 拓扑身份发布（epoch++ = owner 重启身代） */
-    kvc_region_publish_identity(g_region, owner_identity(dev).c_str());
+    kvc_region_publish_identity(g_region, owner_identity(nullptr).c_str());
     LOG(INFO) << "KVC: region " << kvc_region_id(g_region)
-              << " dev=" << dev << " block=" << block
+              << " dev=" << dev_desc << " block=" << block
               << " data_bytes=" << data_bytes;
     if (segment_size > data_bytes) {
         LOG(ERROR) << "KVC: data_bytes " << data_bytes << " < segment_size "

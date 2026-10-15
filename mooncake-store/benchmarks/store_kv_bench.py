@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--pattern", default="")
     parser.add_argument(
-        "--prepare-mode", choices=["auto", "none", "write"], default="auto"
+        "--prepare-mode", choices=["auto", "none", "write", "reuse"], default="auto"
     )
     parser.add_argument("--rwmixread", type=int, default=70)
 
@@ -1342,6 +1342,18 @@ class BenchmarkRunner:
 
     def _maybe_prepare_dataset(self) -> Optional[PhaseStats]:
         if self.args.prepare_mode == "none":
+            return None
+        if self.args.prepare_mode == "reuse":
+            # Dataset was filled by an earlier run (e.g. --scenario fill) with
+            # the same prefix/nr_objects; mark the deterministic id range as
+            # prepared without writing.
+            budget = self._prepare_budget()
+            self.dataset.mark_prepared(
+                range(self.args.object_id_start, self.args.object_id_start + budget)
+            )
+            LOG.info(
+                "prepare reuse: marked %d existing objects as prepared", budget
+            )
             return None
         if self.args.prepare_mode == "write" or self.args.scenario in {
             "read_perf",

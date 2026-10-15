@@ -52,6 +52,12 @@ target_link_libraries(
   batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
 
+# Non-GIL native driver for the store_kv_bench.py zcopy batch direct-read path
+add_executable(store_kv_bench_native store_kv_bench_native.cpp)
+target_link_libraries(store_kv_bench_native PRIVATE mooncake_store
+                                                    gflags::gflags glog::glog
+                                                    pthread)
+
 if(STORE_USE_ETCD)
   add_executable(oplog_batch_bench oplog_batch_bench.cpp)
   target_link_libraries(
