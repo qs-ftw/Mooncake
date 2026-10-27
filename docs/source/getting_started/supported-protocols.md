@@ -17,6 +17,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **barex** | RDMA-capable NIC | Bare-metal RDMA extension | ⚠️ Advanced |
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
 | **shm** | None (POSIX shm, same host) | Same-host DRAM copies without NIC loopback | ⚠️ Advanced |
+| **ubmem** | Kunpeng UB (UB.MEM shared-memory devices) | CPU-copy transfers over shared-memory devices on the UB interconnect | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
 | **hylink** | Hygon DCU + DTK | Hygon DCU HSL fabric communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
@@ -404,6 +405,21 @@ export MC_INTRANODE_NVLINK=true
 - Default off because the path is not NUMA-aware
 - Mooncake Store segments are not shm-backed until a follow-up allocator change
 
+### UB.MEM Transport (ubmem)
+
+**Description:** Transfers over UB shared-memory devices (`/dev/obmm_shmdev*`) on the Kunpeng UB interconnect. Segment memory and local buffers are placed in the devices; a transfer is a CPU memory copy, cross-node through a local mirror device that exposes the peer's memory at the same offsets.
+
+**Use When:**
+- Kunpeng UB interconnect with UB.MEM shared-memory devices is available
+- Transfers should stay on the UB fabric as memory copies
+
+**Requirements:**
+- Kunpeng UB platform with `/dev/obmm_shmdev*` devices
+- Built with `-DUSE_UBMEM=ON`
+- `MC_UBMEM_DEV_PATH` set to a local pool device
+
+**Documentation:** See [UB.MEM Transport](../design/transfer-engine/transport/ubmem_transport.md) for configuration, device layout, and cross-node mirror setup.
+
 ### Ascend Transport (ascend)
 
 **Description:** Huawei Ascend NPU communication using HCCL (Huawei Collective Communication Library) or direct transport.
@@ -739,6 +755,7 @@ If a protocol fails to initialize:
 ../design/transfer-engine/transport/ascend_transport
 ../design/transfer-engine/transport/heterogeneous_ascend
 ../design/transfer-engine/transport/kunpeng_ub_transport
+../design/transfer-engine/transport/ubmem_transport
 ../design/transfer-engine/transport/sunrise_link_transport
 ../design/transfer-engine/transport/flagcx_transport
 ../design/transfer-engine/transport/mpcomm_transport

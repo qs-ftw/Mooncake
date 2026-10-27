@@ -1101,6 +1101,22 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "ubmem") {
+            /* cxl-style "transport-owned segment" model: install maps the
+             * whole device and publishes a protocol="ubmem" segment. */
+            try {
+                transport =
+                    transfer_engine_->installTransport("ubmem", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "ubmem_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install ubmem transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else if (protocol == "cxi") {
             try {
                 transport = transfer_engine_->installTransport("cxi", nullptr);
@@ -1896,12 +1912,42 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     // Collect all transfer operations for parallel execution
-    // Tuple: (index, key, future, replica, cache_used)
+    // Tuple: (index, key, future, replica, cache_used). Only per-key
+    // transports that cannot be grouped (NoF reads) land here; memory
+    // replicas are grouped by transport endpoint below and submitted as
+    // one transfer batch per segment.
     std::vector<std::tuple<size_t, std::string, TransferFuture,
                            Replica::Descriptor, bool>>
         pending_transfers;
+    struct MemoryGroupOp {
+        std::vector<Replica::Descriptor> replicas;
+        std::vector<std::vector<Slice>> batched_slices;
+        std::vector<size_t> key_indexes;
+        std::vector<bool> cache_used;
+        std::optional<TransferFuture> future;
+    };
+    std::unordered_map<std::string, MemoryGroupOp> seg_to_op_map;
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
+    // ubmem gate, resolved from the cached segment descriptor once per
+    // distinct endpoint in this batch; only memory replicas carry an
+    // endpoint, disk replicas fall back to the per-key path
+    std::unordered_map<std::string, bool> ubmem_segment_cache;
+    auto is_ubmem_replica = [&](const Replica::Descriptor& replica) {
+        if (!replica.is_memory_replica()) {
+            return false;
+        }
+        const auto& endpoint = replica.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        auto it = ubmem_segment_cache.find(endpoint);
+        if (it == ubmem_segment_cache.end()) {
+            it = ubmem_segment_cache
+                     .emplace(endpoint,
+                              transfer_submitter_->isUbmemSegment(endpoint))
+                     .first;
+        }
+        return it->second;
+    };
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1970,27 +2016,72 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 replica, slices_it->second, TransferRequest::READ,
                 contiguous_range->ptr, contiguous_range->size,
                 TransferIntent::kForegroundGet);
+            if (!future) {
+                if (hot_cache_ && cache_used) {
+                    hot_cache_->ReleaseHotKey(key);
+                }
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                           << key;
+                results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                continue;
+            }
+            pending_transfers.emplace_back(i, key, std::move(*future), replica,
+                                           cache_used);
+        } else if (is_ubmem_replica(replica)) {
+            // ubmem completes synchronously inside submit, so keys bound for
+            // the same segment are grouped and submitted as one transfer
+            // batch; a per-key submit would pay the whole per-batch
+            // bookkeeping (batch allocation, status polling, deferred
+            // cleanup) once per key.
+            auto& op =
+                seg_to_op_map[replica.get_memory_descriptor()
+                                  .buffer_descriptor.transport_endpoint_];
+            op.replicas.emplace_back(replica);
+            op.batched_slices.emplace_back(slices_it->second);
+            op.key_indexes.push_back(i);
+            op.cache_used.push_back(cache_used);
         } else {
             future = transfer_submitter_->submit(
                 replica, slices_it->second, TransferRequest::READ, nullptr, 0,
                 TransferIntent::kForegroundGet);
-        }
-        if (!future) {
-            // Release cache block if submit failed
-            if (hot_cache_ && cache_used) {
-                hot_cache_->ReleaseHotKey(key);
+            if (!future) {
+                // Release cache block if submit failed
+                if (hot_cache_ && cache_used) {
+                    hot_cache_->ReleaseHotKey(key);
+                }
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                           << key;
+                results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                continue;
             }
-            LOG(ERROR) << "Failed to submit transfer operation for key: "
-                       << key;
-            results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            VLOG(1) << "Submitted transfer for key " << key
+                    << " using strategy: "
+                    << static_cast<int>(future->strategy());
+            pending_transfers.emplace_back(i, key, std::move(*future), replica,
+                                           cache_used);
+        }
+    }
+
+    // Submit one transfer batch per segment: the batch owns a single
+    // BatchID, segment handle and completion instead of one per key.
+    for (auto& seg_to_op : seg_to_op_map) {
+        auto& op = seg_to_op.second;
+        auto future = transfer_submitter_->submit_batch(
+            op.replicas, op.batched_slices, TransferRequest::READ,
+            TransferIntent::kForegroundGet);
+        if (!future) {
+            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
+                if (hot_cache_ && op.cache_used[idx]) {
+                    hot_cache_->ReleaseHotKey(object_keys[op.key_indexes[idx]]);
+                }
+                results[op.key_indexes[idx]] =
+                    tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                           << object_keys[op.key_indexes[idx]];
+            }
             continue;
         }
-
-        VLOG(1) << "Submitted transfer for key " << key
-                << " using strategy: " << static_cast<int>(future->strategy());
-
-        pending_transfers.emplace_back(i, key, std::move(*future), replica,
-                                       cache_used);
+        op.future = std::move(*future);
     }
 
     if (!dfs_read_requests.empty()) {
@@ -2103,6 +2194,51 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
     }
 
+    // Wait for the segment-grouped memory transfers: one completion covers
+    // every key routed to that segment in this batch.
+    for (auto& seg_to_op : seg_to_op_map) {
+        auto& op = seg_to_op.second;
+        if (!op.future) {
+            continue;
+        }
+        ErrorCode result = op.future->get();
+        for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
+            auto index = op.key_indexes[idx];
+            const auto& key = object_keys[index];
+            // Release the cache block after transfer completes (memcpy is done)
+            if (hot_cache_ && op.cache_used[idx]) {
+                hot_cache_->ReleaseHotKey(key);
+            }
+            if (result != ErrorCode::OK) {
+                LOG(ERROR) << "Transfer failed for key: " << key
+                           << " with error: " << static_cast<int>(result);
+                results[index] = tl::unexpected(result);
+                continue;
+            }
+            VLOG(1) << "Transfer completed successfully for key: " << key;
+
+            auto slices_it = slices.find(key);
+            if (slices_it == slices.end()) {
+                results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            auto checksum_result = VerifyObjectChecksum(
+                key, slices_it->second, calculate_total_size(op.replicas[idx]),
+                query_results[index].object_checksum);
+            if (!checksum_result) {
+                results[index] = tl::unexpected(checksum_result.error());
+                continue;
+            }
+            results[index] = {};
+
+            // Frequency admission: only promote frequently accessed keys.
+            // Skip when cache was used (data served from local cache).
+            if (hot_cache_ && ShouldAdmitToHotCache(key, op.cache_used[idx])) {
+                ProcessSlicesAsync(key, slices_it->second, op.replicas[idx]);
+            }
+        }
+    }
+
     // As lease expired is a rare case, we check all the results with the same
     // time_point to avoid too many syscalls
     std::chrono::steady_clock::time_point now =
@@ -2178,7 +2314,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     ReplicateConfig client_cfg = AttachHostId(config);
     AttachHcaAffinity(client_cfg, slices);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
 
@@ -2396,7 +2532,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
 
     ReplicateConfig client_cfg = AttachHostId(config);
     AttachHcaAffinity(client_cfg, slices);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
 
@@ -3836,7 +3972,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
@@ -3887,7 +4023,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
@@ -3936,7 +4072,7 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
     }
 
     ReplicateConfig client_cfg = AttachHostId(config);
-    if (protocol_ == "cxl") {
+    if (protocol_ == "cxl" || protocol_ == "ubmem") {
         client_cfg.preferred_segment = local_hostname_;
     }
 
