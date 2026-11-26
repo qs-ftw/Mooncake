@@ -28,6 +28,7 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "gather_read.h"
 
 namespace mooncake {
 
@@ -278,18 +279,31 @@ class Client {
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
         TransferIntent intent = TransferIntent::kUnspecified);
 
+    bool SupportsGatherRead() const {
+        return !transfer_engine_->isUsingTent() && protocol_ == "rdma" &&
+               transfer_engine_->getTransport("rdma");
+    }
+    std::optional<store::GatherReadOperation> SubmitGatherRead(
+        const std::string& endpoint,
+        const std::vector<store::GatherReadRange>& ranges, void* destination,
+        size_t capacity);
+
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
      * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
+     * @param group_by_target Read exact-size memory replicas on the same
+     * segment with one transfer submission. A failed submission or transfer
+     * then fails every key in that group. A size mismatch stays per key.
+     * Defaults to false.
      * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool group_by_target = false);
 
     /**
      * @brief Stores data with replication
@@ -308,6 +322,10 @@ class Client {
      * @param batched_slices Vector of vectors of data slices to store (indexed
      * to match keys)
      * @param config Replication configuration
+     * @param group_by_target Write every memory replica on the same segment
+     * with one transfer submission. A failed submission or transfer then
+     * fails that replica for every key in the group. Defaults to false.
+     * prefer_alloc_in_same_node also groups through this path.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
@@ -316,14 +334,16 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const ReplicateConfig& config, const WriteBufferStager& stager);
+        const ReplicateConfig& config, const WriteBufferStager& stager,
+        bool group_by_target = false);
 
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
      */
-    ErrorCode TransferWriteRange(const Replica::Descriptor& replica_descriptor,
-                                 std::vector<Slice>& slices,
-                                 uint64_t dst_offset);
+    ErrorCode TransferWriteRange(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t dst_offset,
+        TransferIntent intent = TransferIntent::kUnspecified);
 
     /**
      * @brief Batch ranged read against cached replicas. Fragments from all
@@ -385,6 +405,7 @@ class Client {
      * @param keys Object keys
      * @param batched_slices Vector of vectors of data slices
      * @param config Replication configuration
+     * @param group_by_target Same as BatchPut. Defaults to false.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
         const std::vector<ObjectKey>& keys,
@@ -393,7 +414,8 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const ReplicateConfig& config, const WriteBufferStager& stager);
+        const ReplicateConfig& config, const WriteBufferStager& stager,
+        bool group_by_target = false);
 
     /**
      * @brief Removes an object and all its replicas
@@ -607,6 +629,24 @@ class Client {
      * on success, ErrorCode on failure
      */
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    tl::expected<UUID, ErrorCode> CreateDrainJob(
+        const CreateDrainJobRequest& request);
+
+    tl::expected<UUID, ErrorCode> CreateTimedDrainJob(
+        const CreateDrainJobRequest& request, uint64_t timeout_ms);
+
+    tl::expected<QueryJobResponse, ErrorCode> QueryDrainJob(const UUID& job_id);
+
+    tl::expected<void, ErrorCode> CancelDrainJob(const UUID& job_id);
+
+    tl::expected<ListDrainJobsResponse, ErrorCode> ListDrainJobs(
+        const DrainJobListRequest& request);
+
+    tl::expected<ListTasksResponse, ErrorCode> ListTasks(
+        const TaskListRequest& request);
+
+    tl::expected<void, ErrorCode> CancelTask(const UUID& task_id);
 
     /**
      * @brief Get global segment base address for cxl protocol
@@ -859,6 +899,14 @@ class Client {
     }
 
     /**
+     * @brief Whether a DFS replica is served by an fs adapter that accepts
+     * arbitrary host read buffers, so a host destination can be read into
+     * directly without a staging buffer.
+     */
+    bool CanReadDfsReplicaIntoHostMemory(
+        const Replica::Descriptor& replica) const;
+
+    /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise
      */
@@ -953,6 +1001,14 @@ class Client {
     // SSD read (#3884).
     DiskReplicaHealResult healDanglingLocalDiskReplica(const ObjectKey& key);
 
+    // Reads one byte window of each DISK or DFS replica. `windows[i]` receives
+    // `windows[i].size` bytes starting at `value_offsets[i]` in the value.
+    std::vector<tl::expected<void, ErrorCode>> BatchReadFileReplicaRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<Slice>& windows,
+        const std::vector<uint64_t>& value_offsets);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -997,6 +1053,12 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
+    // Submits one transfer without waiting for it. The caller must get() the
+    // returned future before it releases the slices or the replica.
+    tl::expected<TransferFuture, ErrorCode> SubmitSingleTransfer(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferData(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code,
@@ -1012,11 +1074,18 @@ class Client {
         std::vector<Slice>& slices, uint64_t src_offset);
     std::optional<TransferFuture> SubmitRangeWrite(
         const Replica::Descriptor& replica_descriptor,
-        std::vector<Slice>& slices, uint64_t dst_offset);
+        std::vector<Slice>& slices, uint64_t dst_offset,
+        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferWrite(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,
         TransferIntent intent = TransferIntent::kUnspecified);
+    // Writes the slices to every memory and NoF replica in the list. All
+    // transfers are submitted before any is waited on. Returns the type and
+    // result of each such replica, in order.
+    std::vector<std::pair<ReplicaType, ErrorCode>> WriteMemoryAndNofReplicas(
+        const std::vector<Replica::Descriptor>& replicas,
+        std::vector<Slice>& slices);
     ErrorCode TransferRead(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,
@@ -1027,6 +1096,9 @@ class Client {
     ErrorCode ReadDfsReplica(const std::string& key,
                              const Replica::Descriptor& replica_descriptor,
                              std::vector<Slice>& slices);
+    void ReconcileMissingKvcsReplica(
+        const std::string& key, const QueryResult& query_result,
+        const Replica::Descriptor& replica_descriptor);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -1089,7 +1161,7 @@ class Client {
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
                                             const WriteBufferStager& stager);
-    void SubmitTransfers(std::vector<PutOperation>& ops);
+    void SubmitTransfers(std::vector<PutOperation>& ops, bool group_by_target);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
@@ -1104,12 +1176,6 @@ class Client {
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors);
 
-    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
-        std::vector<PutOperation>& ops, bool is_upsert);
-    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
-        const std::vector<std::string>& object_keys,
-        const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
     HcaAffinity MakeHcaAffinity() const;
     void AttachHcaAffinity(ReplicateConfig& config,
@@ -1126,6 +1192,19 @@ class Client {
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
+    std::unique_ptr<store::GatherReadService> gather_service_;
+    // Protects only gather_endpoint_; never held across an RPC.
+    std::mutex gather_endpoint_mutex_;
+    std::string gather_endpoint_;
+    std::mutex gather_clients_mutex_;
+    struct GatherPeer {
+        std::mutex mutex;
+        std::string endpoint;
+        std::chrono::steady_clock::time_point refresh_at{};
+        std::vector<std::unique_ptr<store::GatherReadClient>> clients;
+    };
+    std::unordered_map<std::string, std::shared_ptr<GatherPeer>>
+        gather_clients_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
     // NoF initiator injected by RealClient; nullptr when NoF is unavailable.
@@ -1161,6 +1240,7 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string host_id_;
+    const std::optional<PhysicalPlacement> physical_placement_;
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
@@ -1220,7 +1300,9 @@ class Client {
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets);
+        const std::vector<Replica::Descriptor>& targets, const UUID* task_id);
+
+    bool IsTaskCancellationRequested(const UUID* task_id);
 
     /**
      * @brief Copy an object's replica to target segments
@@ -1240,7 +1322,8 @@ class Client {
         const std::string& key, const std::string& tenant_id,
         const std::string& source, const std::vector<std::string>& targets,
         const UUID& dynamic_replication_lease_id,
-        uint64_t dynamic_replication_version_epoch);
+        uint64_t dynamic_replication_version_epoch,
+        const UUID* task_id = nullptr);
 
     /**
      * @brief Move an object's replica from source segment to target segment
@@ -1255,7 +1338,8 @@ class Client {
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& tenant_id,
                                        const std::string& source,
-                                       const std::string& target);
+                                       const std::string& target,
+                                       const UUID* task_id = nullptr);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

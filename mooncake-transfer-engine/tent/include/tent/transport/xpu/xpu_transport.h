@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -31,14 +32,34 @@ namespace mooncake {
 class TransferEngineImplTestPeer;
 namespace tent {
 
+// The copies one submitTransferTasks() call enqueued, and the IPC mappings
+// they go through. getTransferStatus() releases the mappings as soon as it
+// sees the copies over, so a mapping dropped meanwhile (e.g. because its
+// exporter exited) is closed even while the caller keeps the sub-batch. If
+// no poll saw them over, the mappings go with the last task: `mappings` is
+// declared before `fence` so that it is destroyed after it, and destroying
+// the fence waits for the copies.
+struct XpuSubmission {
+    std::vector<std::shared_ptr<void>> mappings;
+    XpuPlatform::CopyFence fence;
+    std::atomic<bool> mappings_released{false};
+};
+
 struct XpuTask {
     Request request;
     // Address `request.target_offset` resolves to in this process: the
     // request's own value for a local target, or the imported mapping of the
     // peer's buffer (see XpuTransport::prepareRemoteBuffer) otherwise.
     uint64_t target_addr{0};
+    // The copy once it is enqueued (in_flight): shared by every task of one
+    // submitTransferTasks() call, and polled by getTransferStatus().
+    // in_flight is set after submission, so a poller that sees it also sees
+    // the submission.
+    std::shared_ptr<XpuSubmission> submission;
+    std::atomic<bool> in_flight{false};
     // Atomic so the polling getTransferStatus() reads a consistent, visible
-    // value for the completion written by startTransfer()/notifyProgress().
+    // value for the completion written by submitTransferTasks() or by an
+    // earlier poll.
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
 
@@ -50,11 +71,15 @@ struct XpuTask {
     XpuTask(const XpuTask &other)
         : request(other.request),
           target_addr(other.target_addr),
+          submission(other.submission),
+          in_flight(other.in_flight.load()),
           status_word(other.status_word.load()),
           transferred_bytes(other.transferred_bytes.load()) {}
     XpuTask &operator=(const XpuTask &other) {
         request = other.request;
         target_addr = other.target_addr;
+        submission = other.submission;
+        in_flight.store(other.in_flight.load());
         status_word.store(other.status_word.load());
         transferred_bytes.store(other.transferred_bytes.load());
         return *this;
@@ -65,6 +90,8 @@ struct XpuSubBatch : public Transport::SubBatch {
     std::vector<XpuTask> task_list;
     size_t max_size;
     size_t size() const override { return task_list.size(); }
+    // Copies complete without any further progress notification.
+    bool needsProgressPolling() const override { return true; }
 };
 
 // XpuTransport is the Intel-XPU vendor transport, the oneAPI/SYCL analog of
@@ -85,12 +112,13 @@ struct XpuSubBatch : public Transport::SubBatch {
 //    whenever such a mapping may exist (mayMapRemoteBuffer) and imports only
 //    once XPU is actually selected; if the import fails, the request is
 //    planned again without it and keeps the RDMA dma-buf route or host
-//    staging. Once the peer stops publishing the buffer or the segment is
-//    closed, the mapping is closed after the last copy through it, so the
-//    exporter can reclaim the memory.
+//    staging. Once the peer stops publishing the buffer, the segment is
+//    closed or the exporting process exits, the mapping is closed after the
+//    last copy through it, so the memory can be reclaimed (a mapping keeps
+//    the allocation alive even after its exporter is gone).
 // Cross-node VRAM traffic bypasses this transport entirely when RdmaTransport
 // registered both ends through dma-buf (GPUDirect-style, see
-// xpuDirectRdmaReady); staging remains the fallback for hosts or buffers
+// deviceDirectRdmaReady); staging remains the fallback for hosts or buffers
 // without it.
 //
 // The IPC handle names the exporter's dma-buf by a descriptor of that
@@ -108,6 +136,9 @@ struct XpuSubBatch : public Transport::SubBatch {
 // pointer classification, the copies and the IPC mapping -- through it. The
 // active XpuPlatform resolves both base and interior USM pointers via its
 // backend registry, and the SYCL dependency stays confined to platform_xpu.
+// As in NVLinkTransport, submitTransferTasks() enqueues the copies of a call
+// together without waiting for them (XpuPlatform::submitCopies), and
+// getTransferStatus() completes the tasks once their copies have finished.
 class XpuTransport : public Transport {
    public:
     XpuTransport();
@@ -167,8 +198,6 @@ class XpuTransport : public Transport {
    private:
     friend class ::mooncake::TransferEngineImplTestPeer;
 
-    void startTransfer(XpuTask *task, XpuSubBatch *batch);
-
     // The checks of mayMapRemoteBuffer that need no lock.
     bool sharesHost(SegmentID target_id, const SegmentDesc &segment,
                     const BufferDesc &entry) const;
@@ -180,15 +209,24 @@ class XpuTransport : public Transport {
     std::shared_ptr<void> relocate(SegmentID target_id, int source_device,
                                    uint64_t &addr, uint64_t length);
 
+    // Watch process `pid`, whose buffer was just mapped, so that its
+    // mappings are closed once it exits (see watchExporters). Returns false
+    // when it has already gone. Called with imports_lock_ held.
+    bool watchExporterLocked(pid_t pid);
+    // Body of watcher_: waits on the pidfds in exporters_ and drops the
+    // mappings of every exporter that exits.
+    void watchExporters();
+
     struct ImportEntry {
         std::string attr;  // exporter attribute the mapping was made from
+        pid_t pid;         // exporter process
         uint64_t base;     // peer address of the allocation
         uint64_t size;
         uint64_t generation;  // from `attr`, see addMemoryBuffer
         int owner;            // local device holding the peer's bytes
         int device;           // local device the mapping was opened on
         // Local mapping. Closed (XpuPlatform::closeImport) once the entry is
-        // dropped and no submitTransferTasks() copying through it holds it.
+        // dropped and no pending copy through it holds it (XpuSubmission).
         std::shared_ptr<void> mapping;
 
         // Usable by a copy from/to local device `source_device` (-1: host
@@ -234,6 +272,14 @@ class XpuTransport : public Transport {
 
     std::mutex imports_lock_;
     std::unordered_map<SegmentID, SegmentImports> imports_;
+    // Exit watch over the peer processes mapped from: pidfd per exporter pid
+    // (under imports_lock_), plus an eventfd that wakes watcher_ to pick up
+    // new pidfds or stop. watcher_ starts with the first cross-process
+    // import.
+    std::unordered_map<pid_t, int> exporters_;
+    bool stop_watcher_ = false;
+    int watcher_wakeup_fd_ = -1;
+    std::thread watcher_;
 };
 
 }  // namespace tent

@@ -20,6 +20,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #include "tent/common/config.h"
 #include "tent/platform/cpu.h"
@@ -78,6 +80,33 @@ class XpuPlatform : public CpuPlatform {
     // otherwise the inherited host memcpy.
     Status copy(void *dst, void *src, size_t length) override;
 
+    // Asynchronous form of copy() for XPU memory, used by XpuTransport.
+    // submitCopies enqueues every copy of `copies` without waiting for it, so
+    // a batch costs one submission per copy rather than one blocking round
+    // trip. results[i] tells whether copy i was enqueued (kSubmitted), was
+    // rejected because neither side is XPU memory (kNotDevice), or failed (a
+    // range runs past the end of its allocation, or the runtime refused it).
+    // Copies between two XPUs without peer access are bounced through host
+    // memory before submitCopies returns. `fence` completes once every
+    // enqueued copy has (see copyStatus) and is null when none is pending.
+    // Releasing the last reference to a fence waits for its copies, so the
+    // memory they touch may be released once the fence is gone.
+    struct CopyRequest {
+        void *dst;
+        void *src;
+        size_t length;
+    };
+    enum class CopyResult : uint8_t { kSubmitted, kNotDevice, kFailed };
+    using CopyFence = std::shared_ptr<void>;
+    void submitCopies(const std::vector<CopyRequest> &copies,
+                      std::vector<CopyResult> &results, CopyFence &fence);
+    // State of the copies behind `fence` (a null fence has completed).
+    // kFailed: they are over, but waiting for them failed or their queue
+    // reported an asynchronous error while they ran, so their data is not
+    // known to have landed.
+    enum class CopyStatus : uint8_t { kPending, kCompleted, kFailed };
+    static CopyStatus copyStatus(const CopyFence &fence);
+
     MemoryType getMemoryType(void *addr) override;
 
     const std::vector<RangeLocation> getLocation(
@@ -89,6 +118,13 @@ class XpuPlatform : public CpuPlatform {
     // when a foreign allocation sits in a runtime-managed USM pool (its
     // dma-buf is shared, so the allocation cannot be registered on its own).
     Status exportDmabuf(void *addr, size_t length, DmabufExport &out) override;
+
+    // Page-aligned host memory imported into the devices' shared context
+    // (prepare_for_device_copy), so device queues copy to and from it by DMA
+    // and O_DIRECT file I/O can still use it.
+    Status allocatePinnedHost(void **pptr, size_t size) override;
+
+    Status freePinnedHost(void *ptr, size_t size) override;
 
     // Same-host, cross-process sharing of XPU allocations (used by
     // XpuTransport, not part of the generic Platform interface).

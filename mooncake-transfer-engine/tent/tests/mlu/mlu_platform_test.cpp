@@ -14,13 +14,41 @@
 
 #include <cnrt.h>
 #include <cn_api.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
+#include <atomic>
+#include <cstring>
 #include <limits>
 #include <thread>
 #include <vector>
 
 #include "tent/platform/mlu.h"
+
+namespace {
+std::atomic<bool> stub_pci_lookup{false}, fail_next_pci_lookup{false};
+std::atomic<int> pci_lookup_calls{0};
+constexpr char kPciA[] = "0000:11:00.0";
+constexpr char kPciB[] = "0000:22:00.0";
+}  // namespace
+
+extern "C" cnrtRet_t __real_cnrtDeviceGetByPCIBusId(int*, const char*);
+extern "C" cnrtRet_t __wrap_cnrtDeviceGetByPCIBusId(int* device,
+                                                    const char* pci) {
+    if (!stub_pci_lookup) return __real_cnrtDeviceGetByPCIBusId(device, pci);
+    ++pci_lookup_calls;
+    // Model a runtime that writes an output even when reporting failure.
+    *device = 99;
+    if (fail_next_pci_lookup.exchange(false)) return cnrtErrorCndrvFuncCall;
+    if (std::strcmp(pci, kPciA) == 0)
+        *device = 3;
+    else if (std::strcmp(pci, kPciB) == 0)
+        *device = 7;
+    else
+        return cnrtErrorDeviceInvalid;
+    return cnrtSuccess;
+}
 
 namespace mooncake::tent {
 namespace {
@@ -41,6 +69,97 @@ class MluPlatformTest : public ::testing::Test {
     MluPlatform platform_{std::make_shared<Config>()};
     void* device_ = nullptr;
 };
+
+// These lookup-only tests do not require an MLU allocation or visible hardware.
+class MluPciCacheTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        pci_lookup_calls = 0;
+        fail_next_pci_lookup = false;
+        stub_pci_lookup = true;
+    }
+    void TearDown() override { stub_pci_lookup = false; }
+    MluPlatform platform_{std::make_shared<Config>()};
+};
+
+TEST_F(MluPciCacheTest, CachesEachIdentityWithinPlatformLifetime) {
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        int device = -1;
+        ASSERT_TRUE(platform_.deviceByPciBusId(kPciA, device).ok());
+        EXPECT_EQ(device, 3);
+        ASSERT_TRUE(platform_.deviceByPciBusId(kPciB, device).ok());
+        EXPECT_EQ(device, 7);
+    }
+    EXPECT_EQ(pci_lookup_calls.load(), 2);
+    MluPlatform another(std::make_shared<Config>());
+    int device = -1;
+    ASSERT_TRUE(another.deviceByPciBusId(kPciA, device).ok());
+    EXPECT_EQ(device, 3);
+    EXPECT_EQ(pci_lookup_calls.load(), 3);
+}
+
+TEST_F(MluPciCacheTest, RejectsInvalidIdentityAndRetriesFailedLookup) {
+    int device = 42;
+    EXPECT_TRUE(platform_.deviceByPciBusId("", device).IsInvalidArgument());
+    EXPECT_EQ(device, -1);
+    EXPECT_EQ(pci_lookup_calls.load(), 0);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        device = 42;
+        EXPECT_FALSE(platform_.deviceByPciBusId("missing", device).ok());
+        EXPECT_EQ(device, -1);
+    }
+    EXPECT_EQ(pci_lookup_calls.load(), 2);
+    fail_next_pci_lookup = true;
+    EXPECT_FALSE(platform_.deviceByPciBusId(kPciA, device).ok());
+    EXPECT_EQ(device, -1);
+    ASSERT_TRUE(platform_.deviceByPciBusId(kPciA, device).ok());
+    EXPECT_EQ(device, 3);
+    ASSERT_TRUE(platform_.deviceByPciBusId(kPciA, device).ok());
+    EXPECT_EQ(pci_lookup_calls.load(), 4);
+}
+
+TEST_F(MluPciCacheTest, ConcurrentFirstLookupsShareSuccessfulResult) {
+    std::atomic<bool> start{false};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 16; ++i) {
+        workers.emplace_back([&] {
+            while (!start.load()) std::this_thread::yield();
+            for (int repeat = 0; repeat < 100; ++repeat) {
+                int device = -1;
+                EXPECT_TRUE(platform_.deviceByPciBusId(kPciA, device).ok());
+                EXPECT_EQ(device, 3);
+            }
+        });
+    }
+    start = true;
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(pci_lookup_calls.load(), 1);
+}
+
+TEST_F(MluPlatformTest, PciIdentityRoundTripPreservesCurrentDeviceAndContext) {
+    unsigned int count = 0;
+    ASSERT_EQ(cnrtGetDeviceCount(&count), cnrtSuccess);
+    int previous_device = -1;
+    CNcontext previous_context = nullptr;
+    ASSERT_EQ(cnrtGetDevice(&previous_device), cnrtSuccess);
+    ASSERT_EQ(cnCtxGetCurrent(&previous_context), CN_SUCCESS);
+    for (unsigned int ordinal = 0; ordinal < count; ++ordinal) {
+        std::string pci;
+        ASSERT_TRUE(platform_.devicePciBusId(ordinal, pci).ok());
+        ASSERT_FALSE(pci.empty());
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            int resolved = -1;
+            ASSERT_TRUE(platform_.deviceByPciBusId(pci, resolved).ok());
+            EXPECT_EQ(resolved, static_cast<int>(ordinal));
+            int current_device = -1;
+            CNcontext current_context = nullptr;
+            ASSERT_EQ(cnrtGetDevice(&current_device), cnrtSuccess);
+            ASSERT_EQ(cnCtxGetCurrent(&current_context), CN_SUCCESS);
+            EXPECT_EQ(current_device, previous_device);
+            EXPECT_EQ(current_context, previous_context);
+        }
+    }
+}
 
 TEST(MluLocationTest, CpuPlatformRejectsMluAllocation) {
     CpuPlatform cpu(std::make_shared<Config>());
@@ -82,6 +201,81 @@ TEST_F(MluPlatformTest, ExternalInteriorPointerOnFreshWorker) {
     });
     worker.join();
     EXPECT_TRUE(std::equal(seed.begin(), seed.end() - 17, readback.begin()));
+}
+
+TEST_F(MluPlatformTest, ExportsDeviceRangeAndRejectsHostOrEmpty) {
+    DmabufExport out;
+    uint8_t host[16] = {};
+    EXPECT_TRUE(
+        platform_.exportDmabuf(host, sizeof(host), out).IsInvalidArgument());
+    EXPECT_EQ(out.fd, -1);
+    EXPECT_TRUE(platform_.exportDmabuf(device_, 0, out).IsInvalidArgument());
+    EXPECT_EQ(out.fd, -1);
+
+    auto status = platform_.exportDmabuf(device_, kSize, out);
+    if (!status.ok()) GTEST_SKIP() << "MLU DMA-BUF unavailable: " << status;
+    ASSERT_GE(out.fd, 0);
+    EXPECT_TRUE(out.close_fd);
+    EXPECT_EQ(out.offset, 0u);
+    EXPECT_NE(fcntl(out.fd, F_GETFD), -1);
+    EXPECT_EQ(close(out.fd), 0);
+
+    auto* interior = static_cast<uint8_t*>(device_) + 17;
+    status = platform_.exportDmabuf(interior, 4096, out);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_LE(out.offset, 17u);
+    EXPECT_EQ(close(out.fd), 0);
+}
+
+TEST_F(MluPlatformTest, NonPageMultipleLengthRequiresAlignedBacking) {
+    DmabufExport probe;
+    auto status = platform_.exportDmabuf(device_, kSize, probe);
+    if (!status.ok()) GTEST_SKIP() << "MLU DMA-BUF unavailable: " << status;
+    ASSERT_GE(probe.fd, 0);
+    ASSERT_EQ(close(probe.fd), 0);
+
+    constexpr size_t kNonPageMultipleLength = 1'000'000;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    ASSERT_NE(kNonPageMultipleLength % static_cast<size_t>(page_size), 0u);
+    DmabufExport padded;
+    status = platform_.exportDmabuf(device_, kNonPageMultipleLength, padded);
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_GE(padded.fd, 0);
+    EXPECT_EQ(padded.offset, 0u);
+    EXPECT_EQ(close(padded.fd), 0);
+
+    ASSERT_EQ(cnrtFree(device_), cnrtSuccess);
+    device_ = nullptr;
+    ASSERT_EQ(cnrtMalloc(&device_, kNonPageMultipleLength), cnrtSuccess);
+
+    CNaddr base = 0;
+    cn_uint64_t allocation_size = 0;
+    ASSERT_EQ(cnMemGetAddressRange(&base, &allocation_size,
+                                   reinterpret_cast<CNaddr>(device_)),
+              CN_SUCCESS);
+    ASSERT_EQ(base, reinterpret_cast<CNaddr>(device_));
+    if (allocation_size != kNonPageMultipleLength)
+        GTEST_SKIP() << "CNDrv reports a different allocation size: "
+                     << allocation_size;
+
+    DmabufExport out;
+    status = platform_.exportDmabuf(device_, kNonPageMultipleLength, out);
+    EXPECT_TRUE(status.IsNotImplemented()) << status;
+    EXPECT_EQ(out.fd, -1);
+
+    auto* interior = static_cast<uint8_t*>(device_) + 17;
+    status = platform_.exportDmabuf(interior, kNonPageMultipleLength - 18, out);
+    EXPECT_TRUE(status.IsNotImplemented()) << status;
+    EXPECT_EQ(out.fd, -1);
+}
+
+TEST_F(MluPlatformTest, CrossBoundaryExportIsUnavailable) {
+    DmabufExport out;
+    auto* tail = static_cast<uint8_t*>(device_) + kSize - 1;
+    auto status = platform_.exportDmabuf(tail, 2, out);
+    EXPECT_TRUE(status.IsNotImplemented()) << status;
+    EXPECT_EQ(out.fd, -1);
 }
 
 // A second driver context on the same card catches context restoration bugs

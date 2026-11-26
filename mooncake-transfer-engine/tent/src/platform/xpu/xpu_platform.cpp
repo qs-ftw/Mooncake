@@ -134,6 +134,52 @@ Status XpuPlatform::copy(void* dst, void* src, size_t length) {
     return CpuPlatform::copy(dst, src, length);
 }
 
+Status XpuPlatform::allocatePinnedHost(void** pptr, size_t size) {
+    if (backend().allocHost(pptr, size) != 0)
+        return Status::InternalError(
+            "XPU pinned host allocation failed" LOC_MARK);
+    return Status::OK();
+}
+
+Status XpuPlatform::freePinnedHost(void* ptr, size_t size) {
+    (void)size;
+    if (backend().freeHost(ptr) != 0)
+        return Status::InternalError("XPU pinned host free failed" LOC_MARK);
+    return Status::OK();
+}
+
+void XpuPlatform::submitCopies(const std::vector<CopyRequest>& copies,
+                               std::vector<CopyResult>& results,
+                               CopyFence& fence) {
+    std::vector<XpuSyclBackend::CopyOp> ops;
+    ops.reserve(copies.size());
+    for (const auto& copy : copies)
+        ops.push_back({copy.dst, copy.src, copy.length});
+    std::vector<int> codes(copies.size());
+    fence = backend().submitCopies(ops.data(), ops.size(), codes.data());
+    results.resize(copies.size());
+    for (size_t i = 0; i < codes.size(); ++i) {
+        switch (codes[i]) {
+            case XpuSyclBackend::kCopySubmitted:
+                results[i] = CopyResult::kSubmitted;
+                break;
+            case XpuSyclBackend::kCopyNotDevice:
+                results[i] = CopyResult::kNotDevice;
+                break;
+            default:
+                results[i] = CopyResult::kFailed;
+                break;
+        }
+    }
+}
+
+XpuPlatform::CopyStatus XpuPlatform::copyStatus(const CopyFence& fence) {
+    if (!fence) return CopyStatus::kCompleted;
+    auto* f = static_cast<XpuSyclBackend::CopyFence*>(fence.get());
+    if (!f->done()) return CopyStatus::kPending;
+    return f->failed() ? CopyStatus::kFailed : CopyStatus::kCompleted;
+}
+
 MemoryType XpuPlatform::getMemoryType(void* addr) {
     // USM device memory is classified whether it was allocated through this
     // platform or externally (e.g. a PyTorch XPU tensor registered via

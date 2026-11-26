@@ -15,6 +15,9 @@
 #include "tent/transport/xpu/xpu_transport.h"
 
 #include <glog/logging.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -207,6 +210,7 @@ Status XpuTransport::install(std::string &local_segment_name,
     }
     pid_namespace_ = pidNamespace();
     ipc_generation_ = bootTimeNs();
+    stop_watcher_ = false;
     installed_ = true;
     // Executes same-host copies only: the device<->host staging hop, the
     // intra-node device<->device copy (same XPU, or PCIe P2P between two XPUs
@@ -223,10 +227,23 @@ Status XpuTransport::install(std::string &local_segment_name,
 Status XpuTransport::uninstall() {
     if (installed_) {
         std::unordered_map<SegmentID, SegmentImports> imports;
+        std::thread watcher;
         {
             std::lock_guard<std::mutex> lock(imports_lock_);
             imports.swap(imports_);
+            stop_watcher_ = true;
+            watcher.swap(watcher_);
         }
+        if (watcher.joinable()) {
+            const uint64_t one = 1;
+            if (write(watcher_wakeup_fd_, &one, sizeof(one)) < 0)
+                PLOG(WARNING) << "XpuTransport: cannot wake exit watcher";
+            watcher.join();
+        }
+        for (auto &[pid, pidfd] : exporters_) close(pidfd);
+        exporters_.clear();
+        if (watcher_wakeup_fd_ >= 0) close(watcher_wakeup_fd_);
+        watcher_wakeup_fd_ = -1;
         imports.clear();  // closes the mappings outside imports_lock_
         metadata_.reset();
         platform_ = nullptr;
@@ -265,12 +282,29 @@ Status XpuTransport::submitTransferTasks(
     // Resolve every target before any copy starts, so a request whose peer
     // buffer is not mapped fails synchronously with no half-appended tasks
     // left behind; the engine then fails the task over to another transport.
-    // The mappings are held until the copies below are done (they are
-    // synchronous, so the batch has completed when this returns): a mapping
-    // dropped meanwhile is closed by its last holder.
+    // The tasks hold the mappings until their copies are done (see
+    // XpuSubmission): a mapping dropped meanwhile is closed by its last
+    // holder.
+    //
+    // Every copy is executed by this process: the target is either a local
+    // address (LOCAL_SEGMENT_ID: a staging hop or an intra-node
+    // device<->device copy) or the local mapping of a peer process's XPU
+    // buffer. At least one side must be XPU VRAM. In a staging hop exactly
+    // one side is: the local stage copies VRAM<->host staging buffer, and a
+    // delegated remote stage copies the peer's host staging buffer<->its VRAM
+    // (so the target is the device side there). In a local device<->device
+    // request both sides are, as they are when the target is an imported
+    // peer buffer. Which side is the device depends on the stage, so the
+    // direction is expressed as dataflow: READ pulls the target into
+    // `source`, WRITE pushes `source` into the target; the platform derives
+    // H2D/D2H/D2D from its pointer classification, which resolves base and
+    // interior USM pointers (own, foreign and imported) alike.
     std::vector<uint64_t> targets;
-    std::vector<std::shared_ptr<void>> mappings;
+    std::vector<XpuPlatform::CopyRequest> copies;
     targets.reserve(request_list.size());
+    copies.reserve(request_list.size());
+    auto submission = std::make_shared<XpuSubmission>();
+    auto &mappings = submission->mappings;
     for (auto &request : request_list) {
         uint64_t target = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
@@ -282,10 +316,18 @@ Status XpuTransport::submitTransferTasks(
                     "XPU transport: target buffer of remote segment is not "
                     "mapped into this process" LOC_MARK);
             }
-            mappings.push_back(std::move(mapping));
+            if (mappings.empty() || mappings.back() != mapping)
+                mappings.push_back(std::move(mapping));
         }
         targets.push_back(target);
+        void *target_ptr = reinterpret_cast<void *>(target);
+        if (request.opcode == Request::READ)
+            copies.push_back({request.source, target_ptr, request.length});
+        else
+            copies.push_back({target_ptr, request.source, request.length});
     }
+    std::vector<XpuPlatform::CopyResult> results;
+    platform_->submitCopies(copies, results, submission->fence);
     for (size_t i = 0; i < request_list.size(); ++i) {
         // emplace_back default-constructs in place: XpuTask holds std::atomic
         // members and is therefore non-movable, and the reserved capacity in
@@ -293,68 +335,34 @@ Status XpuTransport::submitTransferTasks(
         auto &task = xpu_batch->task_list.emplace_back();
         task.request = request_list[i];
         task.target_addr = targets[i];
-        task.status_word = TransferStatusEnum::PENDING;
         task.transferred_bytes = 0;
-        startTransfer(&task, xpu_batch);
+        switch (results[i]) {
+            case XpuPlatform::CopyResult::kSubmitted:
+                task.submission = submission;
+                task.in_flight.store(true, std::memory_order_release);
+                break;
+            case XpuPlatform::CopyResult::kNotDevice:
+                // A routing bug or an unclassified external USM pointer; a
+                // plain host memcpy would silently corrupt the transfer.
+                LOG(ERROR) << "XpuTransport: neither source="
+                           << task.request.source << " nor target="
+                           << reinterpret_cast<void *>(task.target_addr)
+                           << " is XPU device memory. This indicates a "
+                              "routing bug or an unclassified external USM "
+                              "pointer.";
+                task.status_word = TransferStatusEnum::FAILED;
+                break;
+            case XpuPlatform::CopyResult::kFailed:
+                LOG(WARNING)
+                    << "XpuTransport: local copy of " << task.request.length
+                    << " bytes from " << copies[i].src << " to "
+                    << copies[i].dst << " failed";
+                task.status_word = TransferStatusEnum::FAILED;
+                break;
+        }
     }
+    xpu_batch->notifyProgress();
     return Status::OK();
-}
-
-void XpuTransport::startTransfer(XpuTask *task, XpuSubBatch *batch) {
-    // Every copy is executed by this process: `target_addr` is either a
-    // local address (LOCAL_SEGMENT_ID: a staging hop or an intra-node
-    // device<->device copy) or the local mapping of a peer process's XPU
-    // buffer (submitTransferTasks relocated it).
-    void *target = reinterpret_cast<void *>(task->target_addr);
-
-    // At least one side must be XPU VRAM. In a staging hop exactly one side
-    // is: the local stage copies VRAM<->host staging buffer, and a delegated
-    // remote stage copies the peer's host staging buffer<->its VRAM (so
-    // `target` is the device side there). In a local device<->device request
-    // both sides are, as they are when `target` is an imported peer buffer.
-    // Classify through the bound XpuPlatform, which resolves both base and
-    // interior USM pointers (own, foreign and imported) via its backend
-    // registry, so a device pointer handed to us as `base + chunk_offset` is
-    // still recognised. If neither side is device memory the request is
-    // malformed; fail loudly rather than let a plain host memcpy corrupt the
-    // transfer.
-    const bool source_is_device =
-        platform_->getMemoryType(task->request.source) == MTYPE_XPU;
-    const bool target_is_device = platform_->getMemoryType(target) == MTYPE_XPU;
-    if (!source_is_device && !target_is_device) {
-        LOG(ERROR) << "XpuTransport: neither source=" << task->request.source
-                   << " nor target=" << target
-                   << " is XPU device memory. This indicates a routing bug or "
-                      "an unclassified external USM pointer.";
-        task->status_word = TransferStatusEnum::FAILED;
-        task->transferred_bytes = 0;
-        batch->notifyProgress();
-        return;
-    }
-
-    // Which side is the device depends on the stage (see above), so the
-    // direction is expressed as dataflow: READ pulls `target` into `source`,
-    // WRITE pushes `source` into `target`. platform_->copy() derives
-    // H2D/D2H/D2D from the pointer classification.
-    Status status;
-    if (task->request.opcode == Request::READ)
-        // target -> source
-        status =
-            platform_->copy(task->request.source, target, task->request.length);
-    else
-        // source -> target
-        status =
-            platform_->copy(target, task->request.source, task->request.length);
-
-    if (status.ok()) {
-        task->transferred_bytes = task->request.length;
-        task->status_word = TransferStatusEnum::COMPLETED;
-    } else {
-        LOG(WARNING) << "XpuTransport: local copy failed: "
-                     << status.ToString();
-        task->status_word = TransferStatusEnum::FAILED;
-    }
-    batch->notifyProgress();
 }
 
 Status XpuTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -366,6 +374,22 @@ Status XpuTransport::getTransferStatus(SubBatchRef batch, int task_id,
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
     auto &task = xpu_batch->task_list[task_id];
+    if (task.status_word.load() == TransferStatusEnum::PENDING &&
+        task.in_flight.load(std::memory_order_acquire)) {
+        auto &submission = *task.submission;
+        const auto copy = XpuPlatform::copyStatus(submission.fence);
+        if (copy != XpuPlatform::CopyStatus::kPending &&
+            !submission.mappings_released.exchange(true))
+            submission.mappings.clear();
+        if (copy == XpuPlatform::CopyStatus::kCompleted) {
+            task.transferred_bytes = task.request.length;
+            task.status_word = TransferStatusEnum::COMPLETED;
+        } else if (copy == XpuPlatform::CopyStatus::kFailed) {
+            LOG(WARNING) << "XpuTransport: waiting for the copy of "
+                         << task.request.length << " bytes failed";
+            task.status_word = TransferStatusEnum::FAILED;
+        }
+    }
     status =
         TransferStatus{task.status_word.load(), task.transferred_bytes.load()};
     return Status::OK();
@@ -579,10 +603,111 @@ bool XpuTransport::prepareRemoteBuffer(SegmentID target_id,
             LOG(WARNING) << "XpuTransport: closing imported buffer failed: "
                          << status.ToString();
     });
-    entries.push_back(ImportEntry{attr_text, attr.base, attr.size,
+    entries.push_back(ImportEntry{attr_text, attr.pid, attr.base, attr.size,
                                   attr.generation, owner, device_index,
                                   std::move(mapping)});
+    if (!watchExporterLocked(attr.pid)) {
+        // The exporter exited meanwhile: nothing can use the mapping, and
+        // keeping it would pin the memory it held.
+        dropped.push_back(std::move(entries.back()));
+        entries.pop_back();
+        return false;
+    }
     return true;
+}
+
+bool XpuTransport::watchExporterLocked(pid_t pid) {
+    // A buffer of this very process is mapped through a dup'ed descriptor
+    // and goes away with it.
+    if (pid == getpid() || exporters_.count(pid)) return true;
+#ifdef SYS_pidfd_open
+    if (watcher_wakeup_fd_ < 0) {
+        watcher_wakeup_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (watcher_wakeup_fd_ < 0) {
+            PLOG(WARNING) << "XpuTransport: cannot watch peer processes; "
+                             "mappings of exited peers stay open until their "
+                             "segment is closed";
+            return true;
+        }
+    }
+    const int pidfd = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+    if (pidfd < 0) {
+        if (errno == ESRCH) return false;
+        PLOG_EVERY_N(WARNING, 1000)
+            << "XpuTransport: cannot watch process " << pid
+            << "; its mappings stay open until its segment is closed";
+        return true;
+    }
+    exporters_.emplace(pid, pidfd);  // pidfd_open sets close-on-exec
+    if (!watcher_.joinable())
+        watcher_ = std::thread(&XpuTransport::watchExporters, this);
+    const uint64_t one = 1;
+    if (write(watcher_wakeup_fd_, &one, sizeof(one)) < 0)
+        PLOG(WARNING) << "XpuTransport: cannot wake exit watcher";
+#endif
+    return true;
+}
+
+void XpuTransport::watchExporters() {
+    std::vector<pollfd> fds;
+    std::vector<pid_t> pids;
+    for (;;) {
+        fds.assign(1, pollfd{watcher_wakeup_fd_, POLLIN, 0});
+        pids.clear();
+        {
+            std::lock_guard<std::mutex> lock(imports_lock_);
+            if (stop_watcher_) return;
+            for (auto &[pid, pidfd] : exporters_) {
+                fds.push_back(pollfd{pidfd, POLLIN, 0});
+                pids.push_back(pid);
+            }
+        }
+        if (poll(fds.data(), fds.size(), -1) < 0) {
+            if (errno == EINTR) continue;
+            PLOG(ERROR) << "XpuTransport: exit watcher stopped; mappings of "
+                           "exited peers stay open until their segment is "
+                           "closed";
+            return;
+        }
+        if (fds[0].revents) {
+            uint64_t count;
+            if (read(watcher_wakeup_fd_, &count, sizeof(count)) < 0 &&
+                errno != EAGAIN)
+                PLOG(WARNING) << "XpuTransport: exit watcher wake-up";
+        }
+        // Only the bookkeeping runs under imports_lock_; the pidfds and the
+        // mappings are closed, and the exits logged, after it is released.
+        std::vector<ImportEntry> dropped;
+        std::vector<std::pair<int, size_t>> exited;  // (fds index, mappings)
+        {
+            std::lock_guard<std::mutex> lock(imports_lock_);
+            for (size_t i = 1; i < fds.size(); ++i) {
+                // A pidfd polls readable once its process has exited.
+                if (!fds[i].revents) continue;
+                const pid_t pid = pids[i - 1];
+                exporters_.erase(pid);
+                const size_t before = dropped.size();
+                for (auto &[target_id, imports] : imports_) {
+                    auto &entries = imports.entries;
+                    for (auto e = entries.begin(); e != entries.end();) {
+                        if (e->pid != pid) {
+                            ++e;
+                            continue;
+                        }
+                        dropped.push_back(std::move(*e));
+                        e = entries.erase(e);
+                    }
+                }
+                exited.emplace_back(i, dropped.size() - before);
+            }
+        }
+        for (auto [i, count] : exited) {
+            close(fds[i].fd);
+            LOG(INFO) << "XpuTransport: peer process " << pids[i - 1]
+                      << " exited; closing its " << count
+                      << " mapped buffer(s)";
+        }
+    }
 }
 
 void XpuTransport::closeRemoteSegment(SegmentID target_id) {

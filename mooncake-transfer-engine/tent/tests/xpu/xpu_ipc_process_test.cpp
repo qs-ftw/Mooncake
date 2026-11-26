@@ -48,6 +48,7 @@
 #include "tent/common/config.h"
 #include "tent/platform/xpu.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transport/xpu/xpu_transport.h"
 
 namespace mooncake {
 class TransferEngineImplTestPeer {
@@ -55,6 +56,23 @@ class TransferEngineImplTestPeer {
     static tent::SelectionResult route(tent::TransferEngineImpl& engine,
                                        const tent::Request& request) {
         return engine.resolveTransport(request, 0);
+    }
+    // Peer buffers the engine's XpuTransport currently holds mapped.
+    static size_t xpuMappings(tent::TransferEngineImpl& engine) {
+        return xpuMappingRefs(engine).size();
+    }
+    // The mappings themselves: each expires once closed, i.e. once neither
+    // the transport nor any copy through it holds it any longer.
+    static std::vector<std::weak_ptr<void>> xpuMappingRefs(
+        tent::TransferEngineImpl& engine) {
+        std::vector<std::weak_ptr<void>> refs;
+        auto* xpu = dynamic_cast<tent::XpuTransport*>(
+            engine.transport_list_[tent::XPU].get());
+        if (!xpu) return refs;
+        std::lock_guard<std::mutex> lock(xpu->imports_lock_);
+        for (auto& [id, imports] : xpu->imports_)
+            for (auto& entry : imports.entries) refs.push_back(entry.mapping);
+        return refs;
     }
 };
 namespace tent {
@@ -367,6 +385,33 @@ TEST_P(XpuIpcProcessTest, DeviceToPeerDeviceReadAndWrite) {
 
 TEST_P(XpuIpcProcessTest, HostToPeerDeviceReadAndWrite) {
     ASSERT_NO_FATAL_FAILURE(transfer("cpu:0"));
+}
+
+// The mapping keeps the peer's allocation alive past the peer itself: it must
+// be closed once the peer exits, without the segment being closed, or a
+// restarted peer finds that device memory still taken. The completed batches
+// stay allocated (until TearDown) and must not hold it open either.
+TEST_P(XpuIpcProcessTest, MappingClosedWhenPeerExits) {
+    ASSERT_NO_FATAL_FAILURE(transfer("xpu:0"));
+    if (IsSkipped()) return;
+    ASSERT_FALSE(batches_.empty());
+    auto refs = TransferEngineImplTestPeer::xpuMappingRefs(*engine_);
+    ASSERT_GT(refs.size(), 0u);
+    ASSERT_TRUE(writeFull(cmd_fd_, "Q", 1));
+    int wstatus = 0;
+    ASSERT_EQ(waitpid(child_, &wstatus, 0), child_);
+    child_ = -1;
+    EXPECT_TRUE(WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0)
+        << "peer exit status " << wstatus;
+    auto closed = [&refs] {
+        return std::all_of(refs.begin(), refs.end(),
+                           [](const auto& ref) { return ref.expired(); });
+    };
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!closed() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(TransferEngineImplTestPeer::xpuMappings(*engine_), 0u);
+    EXPECT_TRUE(closed()) << "a completed batch still holds a mapping";
 }
 
 INSTANTIATE_TEST_SUITE_P(SelectionModes, XpuIpcProcessTest, ::testing::Bool());

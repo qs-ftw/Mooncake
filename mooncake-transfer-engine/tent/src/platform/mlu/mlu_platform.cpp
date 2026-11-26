@@ -17,10 +17,14 @@
 #include <cnrt.h>
 #include <cn_api.h>
 
+#include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string_view>
+#include <unistd.h>
 
 namespace mooncake::tent {
 namespace {
@@ -87,6 +91,43 @@ Status deviceRange(void* ptr, size_t length, bool require_base = false) {
     return Status::OK();
 }
 }  // namespace
+
+Status MluPlatform::devicePciBusId(int device, std::string& identity) {
+    identity.clear();
+    char pci[32] = {};
+    CHECK_STATUS(checked(cnrtDeviceGetPCIBusId(pci, sizeof(pci), device)));
+    const auto end = std::find(std::begin(pci), std::end(pci), '\0');
+    if (end == std::begin(pci) || end == std::end(pci))
+        return Status::InternalError("Invalid MLU PCI bus identity");
+    identity.assign(pci, end);
+    std::transform(identity.begin(), identity.end(), identity.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return Status::OK();
+}
+
+Status MluPlatform::deviceByPciBusId(const std::string& identity, int& device) {
+    device = -1;
+    if (identity.empty())
+        return Status::InvalidArgument("Empty MLU PCI bus identity");
+    std::string normalized(identity);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    std::lock_guard<std::mutex> lock(pci_devices_mutex_);
+    const auto found = pci_devices_.find(normalized);
+    if (found != pci_devices_.end()) {
+        device = found->second;
+        return Status::OK();
+    }
+    int resolved = -1;
+    CHECK_STATUS(
+        checked(cnrtDeviceGetByPCIBusId(&resolved, normalized.c_str())));
+    if (resolved < 0)
+        return Status::InternalError("Invalid MLU device ordinal");
+    // Cache only successful lookups so runtime errors remain retryable.
+    pci_devices_.emplace(std::move(normalized), resolved);
+    device = resolved;
+    return Status::OK();
+}
 
 Status MluPlatform::probe(std::vector<Topology::NicEntry>& nics,
                           std::vector<Topology::MemEntry>& mems) {
@@ -211,6 +252,72 @@ const std::vector<RangeLocation> MluPlatform::getLocation(void* start,
     }
     if (!hostMemory(attr)) return {};
     return CpuPlatform::getLocation(start, len, skip_prefault);
+}
+
+Status MluPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
+    out = DmabufExport{};
+    cnrtPointerAttributes_t attr{};
+    CHECK_STATUS(attributes(addr, attr));
+    if (attr.type != cnrtMemTypeDevice) {
+        return Status::InvalidArgument("Not MLU device memory" LOC_MARK);
+    }
+    if (!length)
+        return Status::InvalidArgument("Empty MLU DMA-BUF range" LOC_MARK);
+
+    ContextGuard guard;
+    CHECK_STATUS(guard.use(addr));
+    CNaddr base = 0;
+    cn_uint64_t allocation_size = 0;
+    CHECK_STATUS(checkedDriver(cnMemGetAddressRange(
+        &base, &allocation_size, reinterpret_cast<CNaddr>(addr))));
+    const auto address = reinterpret_cast<uintptr_t>(addr);
+    if (address < base || address - base >= allocation_size) {
+        return Status::InvalidArgument(
+            "MLU DMA-BUF address outside reported range" LOC_MARK);
+    }
+
+    // cnMemGetHandleForAddressRange requires both the export address and size
+    // to be aligned to the host page size. Derive export_base and export_size
+    // from the allocation and requested range, rejecting ranges that cannot
+    // be aligned without extending beyond the allocation.
+    if (allocation_size > std::numeric_limits<size_t>::max())
+        return Status::InvalidArgument("MLU allocation is too large" LOC_MARK);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        return Status::InternalError("Unable to query page size" LOC_MARK);
+    const size_t page = static_cast<size_t>(page_size);
+    const uintptr_t aligned = address - address % page;
+    if (aligned < base)
+        return Status::NotImplemented(
+            "MLU DMA-BUF export base is not host-page aligned" LOC_MARK);
+    const CNaddr export_base = static_cast<CNaddr>(aligned);
+    const uint64_t offset = address - aligned;
+    if (offset > std::numeric_limits<size_t>::max() - length)
+        return Status::InvalidArgument("MLU DMA-BUF size overflow" LOC_MARK);
+    size_t export_size = offset + length;
+    if (export_size > std::numeric_limits<size_t>::max() - (page - 1))
+        return Status::InvalidArgument("MLU DMA-BUF size overflow" LOC_MARK);
+    export_size = ((export_size + page - 1) / page) * page;
+    // A range beyond this allocation cannot be exported, whether the original
+    // request crosses its end or only page alignment does.
+    const uint64_t export_offset = export_base - base;
+    if (export_size > allocation_size - export_offset)
+        return Status::NotImplemented(
+            "MLU allocation has no page-aligned DMA-BUF export range" LOC_MARK);
+
+    int fd = -1;
+    auto result = cnMemGetHandleForAddressRange(
+        &fd, export_base, export_size, CN_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+    if (result != CN_SUCCESS) {
+        if (fd >= 0) close(fd);
+        return checkedDriver(result);
+    }
+    if (fd < 0)
+        return Status::InternalError("CNDrv returned no DMA-BUF fd" LOC_MARK);
+    out.fd = fd;
+    out.offset = offset;
+    out.close_fd = true;
+    return Status::OK();
 }
 
 Status MluPlatform::synchronizeDevices(const Topology* topology) {

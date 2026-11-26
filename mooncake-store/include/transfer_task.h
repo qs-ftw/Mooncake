@@ -323,6 +323,14 @@ class TransferFuture {
      */
     TransferStrategy strategy() const;
 
+    /**
+     * @brief Create another future that observes the same operation
+     *
+     * Used when one submitted batch carries several keys, so each key can
+     * wait on it independently.
+     */
+    TransferFuture share() const { return TransferFuture(state_); }
+
    private:
     std::shared_ptr<OperationState> state_;
 };
@@ -662,6 +670,12 @@ class TransferSubmitter {
         TransferIntent intent = TransferIntent::kUnspecified);
 
     [[nodiscard]] bool canUseLocalMemcpy(const std::string& endpoint) const;
+
+    /**
+     * @brief Whether the segment behind a transport endpoint published the
+     * ubmem protocol. Resolved from the cached segment descriptor.
+     */
+    [[nodiscard]] bool isUbmemSegment(const std::string& endpoint) const;
 
     /**
      * @brief Pure comparison helper: returns true iff both endpoints are

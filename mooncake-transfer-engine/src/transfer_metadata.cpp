@@ -771,6 +771,19 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "ubmem") {
+        segmentJSON["ubmem_name"] = desc.ubmem_name;
+        segmentJSON["ubmem_base_addr"] =
+            static_cast<Json::UInt64>(desc.ubmem_base_addr);
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["offset"] = static_cast<Json::UInt64>(buffer.offset);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
@@ -1316,6 +1329,21 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
+    } else if (desc->protocol == "ubmem") {
+        desc->ubmem_name = segmentJSON["ubmem_name"].asString();
+        desc->ubmem_base_addr = segmentJSON["ubmem_base_addr"].asUInt64();
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.offset = bufferJSON["offset"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            if (buffer.name.empty() || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;
@@ -1739,9 +1767,8 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
         // Update cache with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto old_iter = segment_id_to_desc_map_.find(segment_id);
-        auto old_desc = old_iter == segment_id_to_desc_map_.end()
-                            ? nullptr
-                            : old_iter->second;
+        if (old_iter == segment_id_to_desc_map_.end()) return nullptr;
+        auto old_desc = old_iter->second;
         if (!shouldInstallFetchedSegmentDesc(segment_name, segment_id, old_desc,
                                              segment_desc)) {
             return old_desc;
@@ -1853,6 +1880,13 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
 
 int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                                               bool update_metadata) {
+    return removeLocalMemoryBuffer(
+        addr, [](const BufferDesc &) { return true; }, update_metadata);
+}
+
+int TransferMetadata::removeLocalMemoryBuffer(
+    void *addr, const std::function<bool(const BufferDesc &)> &pred,
+    bool update_metadata) {
     bool addr_exist = false;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -1860,12 +1894,17 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
         for (auto iter = new_segment_desc->buffers.begin();
              iter != new_segment_desc->buffers.end(); ++iter) {
-            if (iter->addr == (uint64_t)addr
+            if ((iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                || (iter->offset + new_segment_desc->cxl_base_addr) ==
-                       (uint64_t)addr
+                 || (iter->offset + new_segment_desc->cxl_base_addr) ==
+                        (uint64_t)addr
 #endif
-            ) {
+#ifdef USE_UBMEM
+                 || (iter->offset + segment_desc->ubmem_base_addr) ==
+                        (uint64_t)addr
+#endif
+                 ) &&
+                pred(*iter)) {
                 new_segment_desc->buffers.erase(iter);
                 addr_exist = true;
                 new_segment_desc->rebuildBufferRangeIndex();

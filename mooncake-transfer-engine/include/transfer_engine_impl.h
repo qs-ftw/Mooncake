@@ -52,13 +52,10 @@ class TransferEngineImplTestPeer;
 // Whether an Ascend build installs the Ascend transport for a protocol hint.
 // Hints that name no protocol or name Ascend install it; a hint naming a host
 // transport (e.g. "rdma") leaves the classic host-transport selection in
-// charge. HCCL builds (USE_ASCEND without USE_ASCEND_DIRECT) return true here
-// whatever the hint says, so they install Ascend and never reach that block.
+// charge. USE_ASCEND and USE_ASCEND_DIRECT both build the Ascend Direct
+// transport, so they behave identically here.
 static inline bool shouldInstallAscendTransport(const std::string& protocol) {
-#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
-    (void)protocol;
-    return true;
-#elif defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     return protocol.empty() || protocol == "ascend" ||
            protocol == "ascend_direct";
 #else
@@ -136,6 +133,8 @@ class TransferEngineImpl {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    int enableMemoryRegistrationReuse();
+
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
@@ -145,36 +144,12 @@ class TransferEngineImpl {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) {
-        Status s = multi_transports_->submitTransfer(batch_id, entries);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        return multi_transports_->submitTransfer(batch_id, entries);
     }
 
     Status submitScatter(const std::vector<TransferRequest>& entries,
                          MultiTransport::ScatterSubmission& submission) {
-        Status s = multi_transports_->submitScatter(entries, submission);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(submission.batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        return multi_transports_->submitScatter(entries, submission);
     }
 
     Status submitTransferWithNotify(BatchID batch_id,
@@ -183,23 +158,19 @@ class TransferEngineImpl {
         if (entries.empty()) {
             return Status::InvalidArgument("entries must not be empty");
         }
+        // The notify is stored after submit and sent only from
+        // getBatchTransferStatus. An event-enabled batch can be drained and
+        // freed before it is stored and is not polled, so reject it.
+        if (Transport::toBatchDesc(batch_id).event_enabled) {
+            return Status::InvalidArgument(
+                "submitTransferWithNotify is not supported on an "
+                "event-enabled batch; send the notify after draining");
+        }
         auto target_id = entries[0].target_id;
         Status s = multi_transports_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             return s;
         }
-
-#ifdef WITH_METRICS
-        if (metrics_enabled_) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
 
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -222,20 +193,7 @@ class TransferEngineImpl {
     Status mp_submitTransfer(BatchID batch_id,
                              const std::vector<TransferRequest>& entries,
                              std::string& proto) {
-        Status s =
-            multi_transports_->mp_submitTransfer(batch_id, entries, proto);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        return multi_transports_->mp_submitTransfer(batch_id, entries, proto);
     }
 
     Status mp_submitTransferWithNotify(
@@ -250,18 +208,6 @@ class TransferEngineImpl {
         if (!s.ok()) {
             return s;
         }
-
-#ifdef WITH_METRICS
-        if (metrics_enabled_) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
 
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -299,6 +245,18 @@ class TransferEngineImpl {
 
     int probePeerAliveByID(SegmentID target_id);
 
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState& state) const {
+        return multi_transports_->getTaskCongestionState(batch_id, task_id,
+                                                         state);
+    }
+
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail& detail) const {
+        return multi_transports_->getTaskCongestionDetail(batch_id, task_id,
+                                                          detail);
+    }
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) {
         Status result =
@@ -327,6 +285,13 @@ class TransferEngineImpl {
             if (start.time_since_epoch().count() == 0) {
                 goto metrics_done;
             }
+            if (__atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE) == 0) {
+                goto metrics_done;
+            }
+            if (__atomic_exchange_n(&task.log_metrics_recorded, true,
+                                    __ATOMIC_ACQ_REL)) {
+                goto metrics_done;
+            }
 
             // Only record metrics for successful completions
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -339,9 +304,6 @@ class TransferEngineImpl {
                         now - start);
                 task_completion_latency_us_.observe(duration.count());
             }
-
-            // Reset start_time to prevent duplicate processing
-            task.start_time = std::chrono::steady_clock::time_point();
         }
     metrics_done:
 #endif
@@ -353,8 +315,20 @@ class TransferEngineImpl {
             // when the overall status is COMPLETED
             // skip_metrics=true to avoid double counting since we already
             // recorded metrics above
+            //
+            // This task's COMPLETED comes from its slice counters, which a
+            // worker publishes before it bumps the batch's finished-task
+            // counter. If a notification is pending, walk the tasks instead of
+            // trusting that counter: the caller may free the batch next, and
+            // that drops a notification not sent by then.
+            bool notify_pending;
+            {
+                RWSpinlock::ReadGuard guard(send_notifies_lock_);
+                notify_pending = notifies_to_send_.count(batch_id) != 0;
+            }
             TransferStatus dummy_status;
-            auto status = getBatchTransferStatus(batch_id, dummy_status, true);
+            auto status = getBatchTransferStatus(batch_id, dummy_status, true,
+                                                 notify_pending);
             if (!status.ok()) {
                 LOG(ERROR) << status.ToString();
             }
@@ -370,9 +344,10 @@ class TransferEngineImpl {
     }
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status,
-                                  bool skip_metrics = false) {
-        Status result =
-            multi_transports_->getBatchTransferStatus(batch_id, status);
+                                  bool skip_metrics = false,
+                                  bool walk_tasks = false) {
+        Status result = multi_transports_->getBatchTransferStatus(
+            batch_id, status, walk_tasks);
 #ifdef WITH_METRICS
         if (metrics_enabled_ && !skip_metrics && result.ok() &&
             status.s == TransferStatusEnum::COMPLETED) {
@@ -382,6 +357,8 @@ class TransferEngineImpl {
         }
 #endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            // Post a pending submitTransferWithNotify message once. Not
+            // invoked from the eventfd / CQ completion path (RFC #5164).
             std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
             {
                 RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -399,9 +376,37 @@ class TransferEngineImpl {
         return result;
     }
 
+    int completionFd() const {
+        if (!multi_transports_) return -1;
+        return multi_transports_->completionFd();
+    }
+
+    Status enableBatchCompletionNotification(BatchID batch_id) {
+        if (!multi_transports_) {
+            return Status::NotSupportedTransport(
+                "transfer engine is not initialized");
+        }
+        return multi_transports_->enableBatchCompletionNotification(batch_id);
+    }
+
+    Status drainCompletions(std::vector<BatchCompletion>& out) {
+        if (!multi_transports_) {
+            out.clear();
+            return Status::NotSupportedTransport(
+                "transfer engine is not initialized");
+        }
+        return multi_transports_->drainCompletions(out);
+    }
+
     Transport* getTransport(const std::string& proto) {
         if (!multi_transports_) return nullptr;
         return multi_transports_->getTransport(proto);
+    }
+
+    std::string getSegmentProtocol(const std::string& segment_name) {
+        auto desc = metadata_->getSegmentDescByName(segment_name);
+        if (!desc) return {};
+        return desc->protocol;
     }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
@@ -476,15 +481,36 @@ class TransferEngineImpl {
         return local_topology_;
     }
 
+    bool supportsParallelBatchSubmit(Transport::SegmentID peer) const {
+        return multi_transports_ &&
+               multi_transports_->supportsParallelBatchSubmit(peer);
+    }
+
    private:
     struct MemoryRegion {
         void* addr;
         uint64_t length;
         std::string location;
         bool remote_accessible;
+        size_t users = 0;
+        bool releasing = false;
     };
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
+
+    int registerReusableMemory(const std::vector<BufferEntry>& buffers,
+                               const std::string& location);
+    int unregisterReusableMemory(const std::vector<void*>& addresses);
+    int releaseReusableRegions(const std::vector<void*>& regions);
+    void retryFailedRollbacks();
+    int registerLocalMemoryBatchImpl(const std::vector<BufferEntry>& buffers,
+                                     const std::string& location);
+    int unregisterLocalMemoryBatchImpl(const std::vector<void*>& addresses);
+
+    std::atomic<bool> memory_registration_reuse_{false};
+    std::mutex registration_reuse_mutex_;
+    std::map<uintptr_t, size_t> registration_users_;
+    std::vector<void*> failed_rollbacks_;
 
     bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
 
@@ -500,6 +526,8 @@ class TransferEngineImpl {
     void insertMemoryRegionLocked(const MemoryRegion& region);
 
     void eraseMemoryRegionLocked(void* addr);
+
+    void clearSkipRegistrationLocked(void* addr);
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;

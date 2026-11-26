@@ -44,12 +44,17 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <glog/logging.h>
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -250,7 +255,9 @@ class XpuSyclBackend {
                     }
                 }
                 if (!known) contexts_.push_back(ctx);
-                queues_.emplace_back(ctx, d, sycl::property::queue::in_order());
+                queue_errors_.push_back(
+                    std::make_shared<std::atomic<uint64_t>>(0));
+                queues_.push_back(makeQueue(ctx, d, queue_errors_.back()));
                 std::optional<DeviceUuid> uuid;
                 if (d.has(sycl::aspect::ext_intel_device_info_uuid)) {
                     const auto raw =
@@ -261,6 +268,7 @@ class XpuSyclBackend {
                 }
                 uuids_.push_back(uuid);
             }
+            idle_copy_queues_.assign(queues_.size(), {});
             enablePeerAccessLocked();
             initialized_ = true;
             return 0;
@@ -268,6 +276,8 @@ class XpuSyclBackend {
             // Leave no partially-built state: a later init() retry must start
             // from an empty queue list, not resume with duplicate ordinals.
             queues_.clear();
+            queue_errors_.clear();
+            idle_copy_queues_.clear();
             contexts_.clear();
             uuids_.clear();
             peer_.clear();
@@ -360,6 +370,55 @@ class XpuSyclBackend {
         return 1;  // not a base pointer we handed out
     }
 
+    // Page-aligned pinned host memory: ordinary pages, imported into the
+    // devices' context with prepare_for_device_copy so device copies run at
+    // pinned speed. Not sycl::aligned_alloc_host: O_DIRECT I/O must take
+    // page references on the buffer (get_user_pages), which the GPU
+    // driver's USM host mapping refuses, so it fails with EFAULT.
+    // The import is per context, so this fails unless every device shares
+    // one context (one Level Zero platform, the normal case).
+    int allocHost(void **pptr, size_t size) {
+#ifdef SYCL_EXT_ONEAPI_COPY_OPTIMIZE
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_ || !pptr || size == 0 || contexts_.size() != 1)
+            return 1;
+        void *ptr = nullptr;
+        if (posix_memalign(&ptr, 4096, size) != 0) return 1;
+        try {
+            sycl::ext::oneapi::experimental::prepare_for_device_copy(
+                ptr, size, contexts_[0]);
+        } catch (const sycl::exception &) {
+            std::free(ptr);
+            return 1;
+        }
+        *pptr = ptr;
+        return 0;
+#else
+        (void)pptr;
+        (void)size;
+        return 1;
+#endif
+    }
+
+    int freeHost(void *ptr) {
+#ifdef SYCL_EXT_ONEAPI_COPY_OPTIMIZE
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_ || !ptr || contexts_.size() != 1) return 1;
+        int rc = 0;
+        try {
+            sycl::ext::oneapi::experimental::release_from_device_copy(
+                ptr, contexts_[0]);
+        } catch (const sycl::exception &) {
+            rc = 1;
+        }
+        std::free(ptr);
+        return rc;
+#else
+        (void)ptr;
+        return 1;
+#endif
+    }
+
     bool isDevicePtr(const void *addr) {
         std::lock_guard<std::mutex> lock(mu_);
         return classifyLocked(addr) >= 0;
@@ -407,22 +466,163 @@ class XpuSyclBackend {
                 direct->memcpy(dst, src, len).wait();
                 return 0;
             }
-            std::vector<uint8_t> bounce(std::min(len, kBounceChunk));
-            for (size_t off = 0; off < len; off += bounce.size()) {
-                const size_t n = std::min(bounce.size(), len - off);
-                src_q
-                    ->memcpy(bounce.data(),
-                             static_cast<const uint8_t *>(src) + off, n)
-                    .wait();
-                dst_q
-                    ->memcpy(static_cast<uint8_t *>(dst) + off, bounce.data(),
-                             n)
-                    .wait();
-            }
+            bounce(*src_q, *dst_q, dst, src, len);
             return 0;
         } catch (const sycl::exception &) {
             return 1;
         }
+    }
+
+    // One copy of a submitCopies() batch.
+    struct CopyOp {
+        void *dst;
+        const void *src;
+        size_t len;
+    };
+    enum CopyOpResult {
+        kCopySubmitted = 0,
+        // Neither side is USM device memory; nothing was enqueued.
+        kCopyNotDevice = 1,
+        // A range runs past the end of its allocation, or the runtime
+        // refused the copy.
+        kCopyFailed = 2,
+    };
+
+    // Completion of a submitCopies() batch: the last event of every queue it
+    // enqueued on. The queues are in-order, so each of those events completes
+    // only after every earlier copy on its queue. Destroying a fence waits for
+    // it, so the memory its copies touch may be released once it is gone.
+    // A fence is done but failed() when waiting threw or its queue reported
+    // an asynchronous error (a copy failing on the device) while the copies
+    // were in flight: they are over, yet their result is not known to be
+    // written. The runtime delivers such errors to the queue's async_handler
+    // only from wait_and_throw(), not from wait() or a status query, so
+    // completion always goes through wait().
+    class CopyFence {
+       public:
+        ~CopyFence() { wait(); }
+
+        bool done() {
+            if (done_.load(std::memory_order_acquire)) return true;
+            try {
+                for (auto &pending : pending_) {
+                    if (pending.event.get_info<
+                            sycl::info::event::command_execution_status>() !=
+                        sycl::info::event_command_status::complete)
+                        return false;
+                }
+            } catch (const sycl::exception &) {
+                // Cannot query the status; the copies still end.
+            }
+            wait();
+            return true;
+        }
+
+        // Meaningful once done().
+        bool failed() const { return failed_.load(std::memory_order_acquire); }
+
+        void wait() noexcept {
+            if (done_.load(std::memory_order_acquire)) return;
+            for (auto &pending : pending_) {
+                try {
+                    pending.event.wait_and_throw();
+                } catch (const sycl::exception &) {
+                    failed_.store(true, std::memory_order_release);
+                }
+                if (pending.errors->load(std::memory_order_acquire) !=
+                    pending.errors_before)
+                    failed_.store(true, std::memory_order_release);
+            }
+            done_.store(true, std::memory_order_release);
+        }
+
+       private:
+        friend class XpuSyclBackend;
+        struct Pending {
+            sycl::event event;
+            // Error count of the event's queue, and its value when the
+            // copies were enqueued; the queue is shared, so an error of any
+            // copy on it in that window fails this fence.
+            std::shared_ptr<std::atomic<uint64_t>> errors;
+            uint64_t errors_before;
+        };
+        std::vector<Pending> pending_;
+        std::atomic<bool> done_{false};
+        std::atomic<bool> failed_{false};
+    };
+
+    // Enqueue the `n` copies of `ops` without waiting for them. Both sides of
+    // every copy are classified under one lock acquisition, and each copy is
+    // enqueued on the queue copy()/copyD2D() would use: the device side's for
+    // VRAM<->host, the source device's (or, with only the reverse peer access,
+    // the destination's) for VRAM<->VRAM. Pairs of devices without peer
+    // access are bounced through host memory before this returns, as in
+    // copyD2D. results[i] receives the CopyOpResult of copy i. Returns the
+    // fence of the enqueued copies, or null when none is pending.
+    std::shared_ptr<CopyFence> submitCopies(const CopyOp *ops, size_t n,
+                                            int *results) {
+        struct Plan {
+            int queue = -1;                  // direct copy on this queue
+            int src_dev = -1, dst_dev = -1;  // host bounce otherwise
+        };
+        std::vector<Plan> plans(n);
+        std::vector<sycl::queue> queues;
+        std::vector<std::shared_ptr<std::atomic<uint64_t>>> errors;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!initialized_) {
+                std::fill(results, results + n, kCopyFailed);
+                return nullptr;
+            }
+            queues = queues_;
+            errors = queue_errors_;
+            for (size_t i = 0; i < n; ++i) {
+                const int src = resolveLocked(ops[i].src, ops[i].len);
+                const int dst = resolveLocked(ops[i].dst, ops[i].len);
+                auto &plan = plans[i];
+                results[i] = kCopySubmitted;
+                if (src == kPastEnd || dst == kPastEnd)
+                    results[i] = kCopyFailed;
+                else if (src < 0 && dst < 0)
+                    results[i] = kCopyNotDevice;
+                else if (src < 0)
+                    plan.queue = dst;
+                else if (dst < 0 || src == dst || peerLocked(src, dst))
+                    plan.queue = src;
+                else if (peerLocked(dst, src))
+                    plan.queue = dst;
+                else {
+                    plan.src_dev = src;
+                    plan.dst_dev = dst;
+                }
+            }
+        }
+        std::vector<uint64_t> errors_before(queues.size());
+        for (size_t q = 0; q < queues.size(); ++q)
+            errors_before[q] = errors[q]->load(std::memory_order_acquire);
+        std::vector<std::optional<sycl::event>> last(queues.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (results[i] != kCopySubmitted) continue;
+            const auto &plan = plans[i];
+            try {
+                if (plan.queue >= 0)
+                    last[plan.queue] = queues[plan.queue].memcpy(
+                        ops[i].dst, ops[i].src, ops[i].len);
+                else
+                    bounce(queues[plan.src_dev], queues[plan.dst_dev],
+                           ops[i].dst, ops[i].src, ops[i].len);
+            } catch (const sycl::exception &) {
+                results[i] = kCopyFailed;
+            }
+        }
+        auto fence = std::make_shared<CopyFence>();
+        for (size_t q = 0; q < last.size(); ++q) {
+            if (last[q])
+                fence->pending_.push_back(CopyFence::Pending{
+                    std::move(*last[q]), errors[q], errors_before[q]});
+        }
+        if (fence->pending_.empty()) return nullptr;
+        return fence;
     }
 
     // True when device `from` may directly access USM device memory that
@@ -831,17 +1031,35 @@ class XpuSyclBackend {
         return -1;
     }
 
-    // Device ordinal owning the device range [dev, dev+len), or -1 when it is
-    // not device memory or (for our own allocations) runs past the end.
+    // Device ordinal owning the device range [dev, dev+len); -1 when it is
+    // not device memory, kPastEnd when (for our own allocations and imports)
+    // it runs past the end of its allocation.
+    static constexpr int kPastEnd = -2;
     int resolveLocked(const void *dev, size_t len) const {
         if (auto a = findLocked(dev)) {
             const uintptr_t start = reinterpret_cast<uintptr_t>(dev);
             if (!xpu_detail::validateDmabufRange(start - a->base, len, a->size)
                      .ok())
-                return -1;
+                return kPastEnd;
             return a->device;
         }
         return classifyLocked(dev);
+    }
+
+    // Copy between two devices without peer access, in kBounceChunk pieces
+    // through a host buffer. Throws sycl::exception on failure.
+    static void bounce(sycl::queue &src_q, sycl::queue &dst_q, void *dst,
+                       const void *src, size_t len) {
+        std::vector<uint8_t> buffer(std::min(len, kBounceChunk));
+        for (size_t off = 0; off < len; off += buffer.size()) {
+            const size_t n = std::min(buffer.size(), len - off);
+            src_q
+                .memcpy(buffer.data(), static_cast<const uint8_t *>(src) + off,
+                        n)
+                .wait();
+            dst_q.memcpy(static_cast<uint8_t *>(dst) + off, buffer.data(), n)
+                .wait();
+        }
     }
 
     bool peerLocked(int from, int to) const {
@@ -895,25 +1113,84 @@ class XpuSyclBackend {
         }
     }
 
+    // Builds every queue the backend uses, so the per-copy queues get the
+    // same properties as queues_. Asynchronous errors (copies that fail on
+    // the device after being enqueued) are counted in `errors` instead of
+    // reaching the default handler, which terminates the process; CopyFence
+    // reads the count to report them.
+    static sycl::queue makeQueue(
+        const sycl::context &ctx, const sycl::device &dev,
+        const std::shared_ptr<std::atomic<uint64_t>> &errors) {
+        return sycl::queue(
+            ctx, dev,
+            [errors](sycl::exception_list exceptions) {
+                for (const auto &exception : exceptions) {
+                    try {
+                        std::rethrow_exception(exception);
+                    } catch (const std::exception &e) {
+                        LOG(ERROR) << "XPU queue reported an asynchronous "
+                                      "error: "
+                                   << e.what();
+                    } catch (...) {
+                        LOG(ERROR) << "XPU queue reported an asynchronous "
+                                      "error";
+                    }
+                }
+                errors->fetch_add(exceptions.size(), std::memory_order_acq_rel);
+            },
+            sycl::property::queue::in_order());
+    }
+
     int copy(void *dst, const void *src, size_t len, bool to_host) {
-        // Validate and resolve the target queue under the lock, but run the
-        // blocking memcpy().wait() outside it so copies on different devices
-        // are not serialized against one another. queues_ is only appended
-        // during init() and never erased, so the queue handle stays valid after
-        // the lock is released.
+        // Each copy takes a queue of its own from the device's idle list (or
+        // creates one) and runs the blocking memcpy().wait() outside the lock.
+        // Concurrent copies to or from one device then do not queue behind
+        // each other on the device's single in-order queue. The list grows to
+        // the peak number of concurrent copies per device.
         std::optional<sycl::queue> q;
+        std::optional<sycl::queue> proto;
+        std::shared_ptr<std::atomic<uint64_t>> proto_errors;
+        int device_index;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            const int device_index = resolveLocked(to_host ? src : dst, len);
+            device_index = resolveLocked(to_host ? src : dst, len);
             if (device_index < 0) return 1;  // not device memory / past end
-            q = queues_[device_index];
+            auto &idle = idle_copy_queues_[device_index];
+            if (!idle.empty()) {
+                q = std::move(idle.back());
+                idle.pop_back();
+            } else {
+                proto = queues_[device_index];
+                proto_errors = queue_errors_[device_index];
+            }
+        }
+        if (!q) {
+            try {
+                q = makeQueue(proto->get_context(), proto->get_device(),
+                              proto_errors);
+            } catch (...) {
+                // No new queue: run this copy on the device's shared queue,
+                // as all copies did before they had queues of their own.
+            }
         }
         try {
-            q->memcpy(dst, src, len).wait();
-            return 0;
-        } catch (const sycl::exception &) {
+            (q ? *q : *proto).memcpy(dst, src, len).wait();
+        } catch (...) {
+            // Callers expect a status, not an exception. A queue that saw an
+            // error does not go back to the idle list.
             return 1;
         }
+        // The shared queue is still used by copyD2D() and the other
+        // operations, so it never goes into the idle list.
+        if (!q) return 0;
+        try {
+            std::lock_guard<std::mutex> lock(mu_);
+            idle_copy_queues_[device_index].push_back(std::move(*q));
+        } catch (...) {
+            // The copy succeeded; this queue is destroyed instead of being
+            // reused, and a later copy creates another.
+        }
+        return 0;
     }
 
     // Host bounce granularity for device pairs without peer access.
@@ -923,6 +1200,12 @@ class XpuSyclBackend {
     bool initialized_ = false;
     std::vector<sycl::context> contexts_;
     std::vector<sycl::queue> queues_;
+    // Per queues_ entry: asynchronous errors reported by that queue and the
+    // per-copy queues of its device (see makeQueue).
+    std::vector<std::shared_ptr<std::atomic<uint64_t>>> queue_errors_;
+    // Per queues_ entry: in-order queues on the same context and device that
+    // no copy() is using.
+    std::vector<std::vector<sycl::queue>> idle_copy_queues_;
     // Hardware UUID per queues_ entry, when the device reports one.
     std::vector<std::optional<DeviceUuid>> uuids_;
     // Row-major queues_.size() x queues_.size(): peer_[i*n+j] is true when

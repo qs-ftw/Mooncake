@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -186,6 +185,9 @@ class RealClient : public PyClient {
      * @param all_buffers Vector of vectors of pointers to the pre-allocated
      * buffers
      * @param all_sizes Vector of vectors of sizes of the buffers
+     * @param prefer_alloc_in_same_node Group exact-size memory replicas on
+     * one segment into one transfer. A size mismatch stays on the per-key
+     * path. Ascend and ascend_direct group even when this flag is false.
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
      * @note The buffer addresses must resolve to Store-managed registered
@@ -196,7 +198,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -490,6 +492,25 @@ class RealClient : public PyClient {
      */
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
+    tl::expected<UUID, ErrorCode> create_drain_job(
+        const CreateDrainJobRequest &request) override;
+
+    tl::expected<UUID, ErrorCode> create_timed_drain_job(
+        const CreateDrainJobRequest &request, uint64_t timeout_ms) override;
+
+    tl::expected<QueryJobResponse, ErrorCode> query_drain_job(
+        const UUID &job_id) override;
+
+    tl::expected<void, ErrorCode> cancel_drain_job(const UUID &job_id) override;
+
+    tl::expected<ListDrainJobsResponse, ErrorCode> list_drain_jobs(
+        const DrainJobListRequest &request) override;
+
+    tl::expected<ListTasksResponse, ErrorCode> list_tasks(
+        const TaskListRequest &request) override;
+
+    tl::expected<void, ErrorCode> cancel_task(const UUID &task_id) override;
+
     // Hot cache acquire: returns (offset, size) within the shm region.
     // Increments ref_count to prevent eviction.
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_hot_cache(
@@ -688,7 +709,10 @@ class RealClient : public PyClient {
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-        bool enable_embedded_master = false);
+        bool enable_embedded_master = false, bool enable_ssd_prefetch = false,
+        int64_t ssd_prefetch_cooldown_sec = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC,
+        int64_t ssd_prefetch_dedup_ttl_sec =
+            DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -767,7 +791,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
 
     // Demand-side kick, shared by all get paths: a get headed for LOCAL_DISK
     // fires one promotion attempt for those keys (best-effort, non-blocking,
@@ -866,6 +890,13 @@ class RealClient : public PyClient {
 
     tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
 
+    // Additive RPCs keep the legacy exist wire signatures unchanged.
+    tl::expected<bool, ErrorCode> isExistWithOptions_internal(
+        const std::string &key, const ExistOptions &options);
+
+    std::vector<tl::expected<bool, ErrorCode>> batchIsExistWithOptions_internal(
+        const std::vector<std::string> &keys, const ExistOptions &options);
+
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
         const std::vector<std::string> &keys);
 
@@ -925,6 +956,13 @@ class RealClient : public PyClient {
     batch_get_offload_object(const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
 
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+    batch_get_offload_object_ranges(const std::vector<std::string> &keys,
+                                    const std::vector<int64_t> &offsets,
+                                    const std::vector<int64_t> &sizes,
+                                    const std::vector<int64_t> &object_sizes);
+
     /**
      * @brief Releases buffer associated with a specific batch_id.
      * Called by remote client after transfer completion.
@@ -967,7 +1005,7 @@ class RealClient : public PyClient {
      */
     struct OffloadReadRange {
         uint64_t source_offset;
-        int64_t restore_size;
+        int64_t object_size;
     };
 
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
@@ -989,7 +1027,9 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<int64_t> &restore_sizes,
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
-        bool allow_pinned = true);
+        bool allow_pinned = true,
+        const std::vector<int64_t> *value_offsets = nullptr,
+        const std::vector<int64_t> *object_sizes = nullptr);
 
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
@@ -1207,6 +1247,10 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr;
         // Buffers held by dummy via acquire_buffer; keyed by dummy address
+        // Acquires pin mappings with dummy_client_mutex_ shared during I/O.
+        // Serialize their inserts here; other accesses hold
+        // dummy_client_mutex_ exclusively.
+        std::mutex handles_mutex;
         std::unordered_map<uint64_t, std::shared_ptr<BufferHandle>>
             active_handles;
     };
@@ -1216,6 +1260,7 @@ class RealClient : public PyClient {
     mutable std::shared_mutex registered_buffer_mutex_;
     struct BufferRegistrationRecord {
         size_t size;
+        bool te_released = false;
     };
     // A present record means "registered OR cleanup-pending": a record is
     // retained when NoF/TE cleanup failed, in which case the buffer must
@@ -1288,7 +1333,8 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::string> &keys, const UUID &client_id) const;
 
-    // Ensure cleanup executes at most once across multiple entry points
+    // Reject new work once teardown begins; cleanup calls serialize to
+    // completion
     std::atomic<bool> closed_{false};
 
     // Latched when teardown's NoF buffer cleanup failed: repeat teardown
@@ -1306,16 +1352,42 @@ class RealClient : public PyClient {
     std::atomic<bool> dummy_client_monitor_running_{false};
     static constexpr uint64_t kDummyClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    // boost lockfree queue requires trivial assignment operator
-    struct PodUUID {
-        uint64_t first;
-        uint64_t second;
+   private:
+    friend class RealClientHeartbeatTestPeer;
+    struct DummyClientHeartbeat {
+        std::chrono::steady_clock::time_point last_seen;
+        bool needs_remount = false;
     };
-    static constexpr size_t kDummyClientPingQueueSize =
-        128 * 1024;  // Size of the client ping queue
-    boost::lockfree::queue<PodUUID> dummy_client_ping_queue_{
-        kDummyClientPingQueueSize};
+    // Never hold this mutex while waiting for dummy_client_mutex_ or doing
+    // memory registration/teardown. Ping must make progress during those calls.
+    std::mutex dummy_heartbeat_mutex_;
+    std::unordered_map<UUID, DummyClientHeartbeat, boost::hash<UUID>>
+        dummy_heartbeats_;
+    std::weak_ptr<Client> dummy_ping_client_;
+    std::unordered_map<UUID, size_t, boost::hash<UUID>>
+        pending_dummy_registrations_;
     const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    class DummyRegistrationGuard {
+       public:
+        DummyRegistrationGuard(RealClient &owner, const UUID &client_id);
+        ~DummyRegistrationGuard();
+        DummyRegistrationGuard(const DummyRegistrationGuard &) = delete;
+        DummyRegistrationGuard &operator=(const DummyRegistrationGuard &) =
+            delete;
+
+        void mark_registered(bool is_local_buffer);
+
+       private:
+        RealClient &owner_;
+        UUID client_id_;
+    };
+    // Call with dummy_client_mutex_ held exclusively.
+    tl::expected<void, ErrorCode> unmap_shm_locked(const UUID &client_id);
+    tl::expected<void, ErrorCode> ascend_unmap_shm_locked(
+        const UUID &client_id);
+    bool try_expire_dummy_client(const UUID &client_id);
+
+   public:
     int64_t view_version_ = 0;
 
     // IPC Server members for receiving FD from Dummy Clients
@@ -1339,6 +1411,10 @@ class RealClient : public PyClient {
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
+    std::mutex teardown_mutex_;
+    ErrorCode storage_shutdown_error_ = ErrorCode::OK;
+    RpcDrainGuard offload_rpc_drain_;
+    friend class RealClientShutdownTestPeer;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 
     struct SessionRangeReadRequest {
@@ -1366,6 +1442,8 @@ class RealClient : public PyClient {
         std::vector<std::string> object_keys;
         std::vector<QueryResult> cached_query_results;
         std::unordered_map<std::string, std::vector<Slice>> object_slices;
+        std::unordered_map<std::string, uint64_t> window_offsets;
+        std::unordered_map<std::string, uint64_t> window_lengths;
     };
 
     bool validate_session_range_batch_arguments(
@@ -1409,12 +1487,12 @@ class RealClient : public PyClient {
         std::vector<int> &results);
 
     tl::expected<void, ErrorCode> scatter_session_range_read(
-        const SessionRangeReadRequest &request,
-        const void *staging_buffer) const;
+        const SessionRangeReadRequest &request, const void *staging_buffer,
+        uint64_t window_offset) const;
 
     void complete_staged_session_range_read(
         const SessionRangeReadRequest &request, const void *staging_buffer,
-        std::vector<int> &results);
+        uint64_t window_offset, std::vector<int> &results);
 
     bool invalidate_expired_get_session(const SessionRangeReadRequest &request,
                                         std::vector<int> &results);
@@ -1437,13 +1515,21 @@ class RealClient : public PyClient {
         bool enable_ssd_offload, bool start_offload_rpc_server,
         const std::string &ssd_offload_path, const std::string &tenant_id,
         bool enable_client_http_server, int client_http_port,
-        bool enable_embedded_master);
+        bool enable_embedded_master, bool enable_ssd_prefetch,
+        int64_t ssd_prefetch_cooldown_sec, int64_t ssd_prefetch_dedup_ttl_sec);
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;
+
+    // DFS replicas whose fs adapter accepts arbitrary host read buffers are
+    // read straight into host destinations; device destinations, more than
+    // IOV_MAX destinations and other DFS adapters keep the staging buffer.
+    bool can_use_direct_dfs_read(const Replica::Descriptor &replica,
+                                 const std::vector<void *> &buffers) const;
 
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
